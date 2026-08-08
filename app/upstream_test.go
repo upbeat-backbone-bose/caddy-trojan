@@ -137,11 +137,11 @@ func TestMemoryUpstreamSendTaskSurvivesClosedChannel(t *testing.T) {
 // that need u.up to be non-nil so Add/Delete/Consume reach sendTask.
 type noopUpstream struct{}
 
-func (noopUpstream) Add(string) error                         { return nil }
-func (noopUpstream) Delete(string) error                      { return nil }
-func (noopUpstream) Range(func(string, int64, int64))         {}
-func (noopUpstream) Validate(string) bool                     { return true }
-func (noopUpstream) Consume(string, int64, int64) error       { return nil }
+func (noopUpstream) Add(string) error                   { return nil }
+func (noopUpstream) Delete(string) error                { return nil }
+func (noopUpstream) Range(func(string, int64, int64))   {}
+func (noopUpstream) Validate(string) bool               { return true }
+func (noopUpstream) Consume(string, int64, int64) error { return nil }
 
 // TestMemoryUpstreamValidateAppliesDelay verifies the constant-time delay on
 // MemoryUpstream.Validate: both hit and miss paths must take ≥validateDelay

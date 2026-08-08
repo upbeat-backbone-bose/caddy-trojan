@@ -45,7 +45,7 @@ func (c *wakeNetConn) Read(b []byte) (int, error) {
 	return 0, osErrDeadlineExceeded
 }
 
-func (c *wakeNetConn) Write(b []byte) (int, error) { return len(b), nil }
+func (c *wakeNetConn) Write(b []byte) (int, error)        { return len(b), nil }
 func (c *wakeNetConn) Close() error                       { return nil }
 func (c *wakeNetConn) LocalAddr() net.Addr                { return nil }
 func (c *wakeNetConn) RemoteAddr() net.Addr               { return nil }

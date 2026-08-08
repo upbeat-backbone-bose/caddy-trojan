@@ -73,6 +73,10 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 				err = er
 				break
 			}
+			if b[l+2] != 0x0d || b[l+3] != 0x0a {
+				err = errInvalidCRLF
+				break
+			}
 
 			l += (int(b[l])<<8 | int(b[l+1]))
 			nr += int64(l) + 4
@@ -137,9 +141,11 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 		rc.SetWriteDeadline(time.Now())
 
 		if errors.Is(err, io.EOF) || errors.Is(err, os.ErrDeadlineExceeded) {
+			wakeReader(w)
 			r := <-errCh
 			return r.Num, nw, r.Err
 		}
+		wakeReader(w)
 		r := <-errCh
 		return r.Num, nw, err
 	}(rc, w, errCh, timeout)

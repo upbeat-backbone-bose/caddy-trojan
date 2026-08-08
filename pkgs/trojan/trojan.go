@@ -15,6 +15,24 @@ import (
 
 const HeaderLen = 56
 
+// errInvalidCRLF is returned when the protocol CRLF terminator is missing or
+// malformed.
+var errInvalidCRLF = errors.New("invalid CRLF terminator")
+
+// wakeReader sets an immediate read deadline on w's underlying connection so
+// that a goroutine blocked reading from the same connection is released. It is
+// used right before waiting on errCh so that a silent peer cannot deadlock
+// HandleTCP/HandleUDP forever (each half-close would otherwise leave the other
+// direction blocked and the deferred Close never runs). It applies to the
+// raw TCP / WebSocket / UDP tunnel paths, where the reader and writer share
+// the same net.Conn; the HTTP/2 and HTTP/3 CONNECT paths pass an http.Body /
+// http.Flusher instead and are governed by the HTTP server's own timeouts.
+func wakeReader(w io.Writer) {
+	if c, ok := w.(net.Conn); ok {
+		_ = c.SetReadDeadline(time.Now())
+	}
+}
+
 const (
 	CmdConnect   = 1
 	CmdAssociate = 3
@@ -50,6 +68,9 @@ func HandleWithDialer(r io.Reader, w io.Writer, d Dialer) (int64, int64, error) 
 	// read 0x0d, 0x0a
 	if _, err := io.ReadFull(r, b[1:3]); err != nil {
 		return 0, 0, fmt.Errorf("read 0x0d 0x0a error: %w", err)
+	}
+	if b[1] != 0x0d || b[2] != 0x0a {
+		return 0, 0, errInvalidCRLF
 	}
 
 	switch b[0] {

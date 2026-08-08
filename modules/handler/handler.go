@@ -5,8 +5,11 @@ import (
 
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -30,17 +33,28 @@ func init() {
 	})
 }
 
+// headerTimeout bounds how long a peer may stall while sending the trojan
+// header after a WebSocket upgrade; without it an unauthenticated peer could
+// hold the handler goroutine forever.
+const headerTimeout = 10 * time.Second
+
 // Handler implements an HTTP handler that ...
 type Handler struct {
-	ProxyName string `json:"proxy_name,omitempty"`
-	WebSocket bool   `json:"websocket,omitempty"`
-	Connect   bool   `json:"connect_method,omitempty"`
-	Verbose   bool   `json:"verbose,omitempty"`
+	ProxyName   string   `json:"proxy_name,omitempty"`
+	WebSocket   bool     `json:"websocket,omitempty"`
+	Connect     bool     `json:"connect_method,omitempty"`
+	Verbose     bool     `json:"verbose,omitempty"`
+	OriginAllow []string `json:"origin_allow,omitempty"`
 
 	upstream app.Upstream
 	proxy    app.Proxy
 	logger   *zap.Logger
 	upgrader websocket.Upgrader
+
+	// headerTimeout overrides the default header read deadline when non-zero.
+	// It is unexported because production configuration uses the constant;
+	// tests in this package inject a smaller value to avoid 10-second runs.
+	headerTimeout time.Duration
 }
 
 // CaddyModule returns the Caddy module information.
@@ -54,6 +68,7 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision implements caddy.Provisioner.
 func (m *Handler) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger(m)
+	m.upgrader.CheckOrigin = m.checkOrigin
 	if _, err := ctx.AppIfConfigured(app.CaddyAppID); err != nil {
 		return fmt.Errorf("trojan handler configure error: %w", err)
 	}
@@ -113,6 +128,20 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		c := websocket.NewConn(conn)
 		defer c.Close()
 
+		// Bound the trojan header read so an unauthenticated peer cannot
+		// hold this goroutine forever; the deadline is cleared on exit so
+		// the tunnel is not affected.
+		if nc, ok := c.UnderlyingConn().(net.Conn); ok {
+			timeout := headerTimeout
+			if m.headerTimeout > 0 {
+				timeout = m.headerTimeout
+			}
+			_ = nc.SetReadDeadline(time.Now().Add(timeout))
+			defer func() {
+				_ = nc.SetReadDeadline(time.Time{})
+			}()
+		}
+
 		b := [trojan.HeaderLen + 2]byte{}
 		if _, err := io.ReadFull(c, b[:]); err != nil {
 			m.logger.Error(fmt.Sprintf("read trojan header error: %v", err))
@@ -134,6 +163,30 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	return next.ServeHTTP(w, r)
+}
+
+// checkOrigin allows same-origin and Origin-less (non-browser) WebSocket
+// clients while rejecting cross-site browsers, which could otherwise use a
+// victim's browser as an open proxy or to guess trojan passwords. Additional
+// origins (e.g. CDN or reverse-proxy setups that send a custom Origin) can be
+// allow-listed via the "origin_allow" Caddyfile option or the
+// "origin_allow" JSON field, matching the Origin host (host[:port]).
+func (m *Handler) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Non-browser clients (trojan/v2ray) do not send Origin.
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	for _, allow := range m.OriginAllow {
+		if strings.EqualFold(u.Host, allow) {
+			return true
+		}
+	}
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 // UnmarshalCaddyfile unmarshals Caddyfile tokens into h.
@@ -167,6 +220,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Err("only one verbose is not allowed")
 			}
 			h.Verbose = true
+		case "origin_allow":
+			var origin string
+			if !d.Args(&origin) {
+				return d.Err("origin_allow requires an origin host, e.g. origin_allow cdn.example.com")
+			}
+			h.OriginAllow = append(h.OriginAllow, origin)
 		}
 	}
 	return nil

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -105,6 +106,12 @@ var (
 	_ caddyfile.Unmarshaler = (*ListenerWrapper)(nil)
 )
 
+// sniffTimeout bounds how long a connection may stall while the listener
+// reads the trojan header prefix. Without it, an unauthenticated peer could
+// hold a goroutine and a file descriptor forever by sending a few bytes (or
+// nothing) after the TLS handshake.
+const sniffTimeout = 10 * time.Second
+
 type Listener struct {
 	Verbose bool
 
@@ -157,12 +164,22 @@ func (l *Listener) loop() {
 				return
 			default:
 				l.Logger.Error(fmt.Sprintf("accept net.Conn error: %v", err))
+				// Back off briefly so a failing underlying listener (e.g.
+				// during shutdown) does not spin the loop at full speed.
+				time.Sleep(100 * time.Millisecond)
 			}
 			continue
 		}
 
 		go func(c net.Conn, lg *zap.Logger, up app.Upstream) {
 			b := make([]byte, trojan.HeaderLen+2)
+			// Bound the sniff read; the deadline is cleared on every exit path
+			// so caddy/http handles the connection with its own timeouts.
+			_ = c.SetReadDeadline(time.Now().Add(sniffTimeout))
+			defer func() {
+				_ = c.SetReadDeadline(time.Time{})
+			}()
+
 			for n := 0; n < trojan.HeaderLen+2; n += 1 {
 				nr, err := c.Read(b[n : n+1])
 				if err != nil {
@@ -170,7 +187,14 @@ func (l *Listener) loop() {
 						lg.Error(fmt.Sprintf("read prefix error: read tcp %v -> %v: read: %v", c.RemoteAddr(), c.LocalAddr(), err))
 					} else {
 						lg.Error(fmt.Sprintf("read prefix error, not io, rewind and let normal caddy deal with it: %v", err))
-						l.conns <- rawconn.RewindConn(c, b[:n+1])
+						select {
+						case <-l.closed:
+							c.Close()
+						case l.conns <- rawconn.RewindConn(c, b[:n+nr]):
+							// Rewind only the bytes actually read; on a partial
+							// read (nr > 0) that includes b[n], otherwise b[n]
+							// is uninitialized and must not be replayed.
+						}
 						return
 					}
 					c.Close()
@@ -184,8 +208,7 @@ func (l *Listener) loop() {
 					select {
 					case <-l.closed:
 						c.Close()
-					default:
-						l.conns <- rawconn.RewindConn(c, b[:n+1])
+					case l.conns <- rawconn.RewindConn(c, b[:n+1]):
 					}
 					return
 				}
@@ -196,8 +219,7 @@ func (l *Listener) loop() {
 				select {
 				case <-l.closed:
 					c.Close()
-				default:
-					l.conns <- rawconn.RewindConn(c, b)
+				case l.conns <- rawconn.RewindConn(c, b):
 				}
 				return
 			}

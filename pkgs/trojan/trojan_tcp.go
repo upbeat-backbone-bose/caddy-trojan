@@ -95,6 +95,7 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 			}); ok {
 				cw.CloseWrite()
 			}
+			wakeReader(w)
 			r := <-errCh
 			return r.Num, nw, r.Err
 		}
@@ -126,6 +127,7 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 			}); ok {
 				cw.CloseWrite()
 			}
+			wakeReader(w)
 			r := <-errCh
 			return r.Num, nw, r.Err
 		}
@@ -135,6 +137,7 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 		}); ok {
 			cw.CloseWrite()
 		}
+		wakeReader(w)
 		r := <-errCh
 		return r.Num, nw, err
 	}(rc, w, errCh)

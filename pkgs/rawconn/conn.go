@@ -6,31 +6,19 @@ import (
 	"errors"
 	"io"
 	"net"
-	"reflect"
-	"unsafe"
 )
 
+// RewindConn returns a connection that replays the already-read bytes
+// (plaintext, for a *tls.Conn) before continuing to read from conn.
+//
+// The rewind is done with a wrapper rather than by reaching into the
+// unexported internals of crypto/tls.Conn, whose layout is not stable across
+// Go releases (the "input" field is a value type since Go 1.25 and is not
+// addressable via its old pointer form). The wrapper replays plaintext above
+// the TLS layer, which is data-preserving and does not depend on stdlib
+// internals.
 func RewindConn(conn net.Conn, read []byte) net.Conn {
-	if tlsConn, ok := conn.(*tls.Conn); ok {
-		var (
-			tlsInput, _ = reflect.TypeOf(tls.Conn{}).FieldByName("input")
-			input       = (*bytes.Reader)(unsafe.Add(unsafe.Pointer(tlsConn), tlsInput.Offset))
-			remaining   = input.Len()
-			size        = int(input.Size())
-			buffered    = len(read)
-		)
-		if buffered <= size {
-			_, _ = input.Seek(0, 0)
-		} else {
-			buf := make([]byte, buffered+remaining)
-			copy(buf, read)
-			_, _ = input.Read(buf[buffered:])
-			input.Reset(buf)
-		}
-		return tlsConn
-	} else {
-		return NewConn(conn, read)
-	}
+	return NewConn(conn, read)
 }
 
 type conn struct {
@@ -68,4 +56,16 @@ func (c *conn) CloseWrite() error {
 		return cw.CloseWrite()
 	}
 	return errors.New("not supported")
+}
+
+// ConnectionState forwards the TLS state when the wrapped connection is a
+// *tls.Conn. caddy's http2listener checks the exported connectionStater
+// interface and wraps the conn so its ConnContext can recover the TLS state;
+// for non-TLS wrapped connections an empty (zero-version) state is returned,
+// which is harmless.
+func (c *conn) ConnectionState() tls.ConnectionState {
+	if tc, ok := c.Conn.(*tls.Conn); ok {
+		return tc.ConnectionState()
+	}
+	return tls.ConnectionState{}
 }

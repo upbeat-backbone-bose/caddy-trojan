@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 
 	"golang.org/x/net/proxy"
@@ -17,6 +18,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 
 	"github.com/imgk/caddy-trojan/pkgs/domaintree"
+	"github.com/imgk/caddy-trojan/pkgs/rawconn"
 	"github.com/imgk/caddy-trojan/pkgs/trojan"
 	"github.com/imgk/caddy-trojan/pkgs/x"
 )
@@ -145,7 +147,7 @@ func (p *EnvProxy) Provision(ctx caddy.Context) error {
 	if p.ProxyRaw != nil {
 		mod, err := ctx.LoadModule(p, "ProxyRaw")
 		if err != nil {
-			return nil
+			return err
 		}
 		p.proxy = mod.(Proxy)
 		p.dialer = proxy.FromEnvironmentUsing(p.proxy)
@@ -210,7 +212,7 @@ func (p *SocksProxy) Provision(ctx caddy.Context) error {
 	if p.ProxyRaw != nil {
 		mod, err := ctx.LoadModule(p, "ProxyRaw")
 		if err != nil {
-			return nil
+			return err
 		}
 		p.proxy = mod.(Proxy)
 	} else {
@@ -291,7 +293,7 @@ func (p *HttpProxy) Provision(ctx caddy.Context) error {
 	if p.ProxyRaw != nil {
 		mod, err := ctx.LoadModule(p, "ProxyRaw")
 		if err != nil {
-			return nil
+			return err
 		}
 		p.proxy = mod.(Proxy)
 	} else {
@@ -310,7 +312,21 @@ func (p *HttpProxy) Close() error {
 	return p.proxy.Close()
 }
 
+// validateProxyTarget rejects target addresses that could break out of the
+// HTTP CONNECT request line (e.g. CR/LF header injection) or smuggle bytes
+// into the upstream proxy connection.
+func validateProxyTarget(addr string) error {
+	if strings.ContainsAny(addr, "\r\n\x00 \t") {
+		return errors.New("invalid target address: control characters are not allowed")
+	}
+	return nil
+}
+
 func (p *HttpProxy) Dial(network, addr string) (net.Conn, error) {
+	if err := validateProxyTarget(addr); err != nil {
+		return nil, err
+	}
+
 	conn, err := p.proxy.Dial("tcp", p.Server)
 	if err != nil {
 		return nil, err
@@ -318,7 +334,8 @@ func (p *HttpProxy) Dial(network, addr string) (net.Conn, error) {
 
 	req, err := http.NewRequest(http.MethodConnect, p.tcpURL, nil)
 	if err != nil {
-		return conn, fmt.Errorf("request error: %w", err)
+		_ = conn.Close()
+		return nil, fmt.Errorf("request error: %w", err)
 	}
 	req.URL.Opaque = addr
 	if p.basicAuth != "" {
@@ -327,15 +344,27 @@ func (p *HttpProxy) Dial(network, addr string) (net.Conn, error) {
 
 	err = req.WriteProxy(conn)
 	if err != nil {
-		return conn, fmt.Errorf("write request error: %w", err)
+		_ = conn.Close()
+		return nil, fmt.Errorf("write request error: %w", err)
 	}
 
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return conn, fmt.Errorf("read response error: %w", err)
+		_ = conn.Close()
+		return nil, fmt.Errorf("read response error: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return conn, fmt.Errorf("server status code error: %v", resp.StatusCode)
+		_ = conn.Close()
+		return nil, fmt.Errorf("server status code error: %v", resp.StatusCode)
+	}
+	// bufio may have read past the response head into the tunnel payload;
+	// replay those bytes so the first tunneled packet is not lost. Peek of
+	// the buffered bytes is an in-memory operation and cannot fail here.
+	if n := br.Buffered(); n > 0 {
+		if b, err := br.Peek(n); err == nil {
+			return rawconn.NewConn(conn, b), nil
+		}
 	}
 	return conn, nil
 }

@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
 
 	"github.com/imgk/caddy-trojan/pkgs/trojan"
-	"github.com/imgk/caddy-trojan/pkgs/x"
 )
 
 func init() {
@@ -32,6 +32,12 @@ type Upstream interface {
 	Validate(string) bool
 	Consume(string, int64, int64) error
 }
+
+// validateDelay is applied uniformly on both success and failure paths of
+// Validate so that password validation is a slow, constant-time operation
+// from an observer's perspective: it raises the cost of online password
+// guessing and removes the success/failure timing signal.
+const validateDelay = 250 * time.Millisecond
 
 type TaskType int
 
@@ -118,6 +124,20 @@ func (u *MemoryUpstream) Cleanup() error {
 	return nil
 }
 
+// sendTask forwards t to the persistence goroutine, recovering from a send on
+// a closed channel. Cleanup closes u.ch while in-flight connections may still
+// call Add/Delete/Consume; without this guard that shutdown race would panic
+// and crash the whole process.
+func (u *MemoryUpstream) sendTask(t Task) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	u.ch <- t
+	return true
+}
+
 func (u *MemoryUpstream) Add(s string) error {
 	b := [trojan.HeaderLen]byte{}
 	trojan.GenKey(s, b[:])
@@ -130,7 +150,7 @@ func (u *MemoryUpstream) Add(s string) error {
 
 	t := Task{Type: TaskAdd}
 	t.Value.Password = s
-	u.ch <- t
+	u.sendTask(t)
 	return nil
 }
 
@@ -146,7 +166,7 @@ func (u *MemoryUpstream) AddKey(key string) {
 func (u *MemoryUpstream) Delete(s string) error {
 	b := [trojan.HeaderLen]byte{}
 	trojan.GenKey(s, b[:])
-	key := x.ByteSliceToString(b[:])
+	key := string(b[:])
 	u.mu.Lock()
 	delete(u.mm, key)
 	u.mu.Unlock()
@@ -157,7 +177,7 @@ func (u *MemoryUpstream) Delete(s string) error {
 
 	t := Task{Type: TaskDelete}
 	t.Value.Password = s
-	u.ch <- t
+	u.sendTask(t)
 	return nil
 }
 
@@ -170,6 +190,7 @@ func (u *MemoryUpstream) Range(fn func(string, int64, int64)) {
 }
 
 func (u *MemoryUpstream) Validate(k string) bool {
+	time.Sleep(validateDelay)
 	u.mu.RLock()
 	_, ok := u.mm[k]
 	u.mu.RUnlock()
@@ -177,6 +198,10 @@ func (u *MemoryUpstream) Validate(k string) bool {
 }
 
 func (u *MemoryUpstream) Consume(k string, nr, nw int64) error {
+	// Deep-copy k: it may be a zero-copy string (see pkgs/x.ByteSliceToString)
+	// backed by a caller-owned buffer. It is used as a map key and forwarded to
+	// the persistence goroutine asynchronously, so it must own its memory.
+	k = strings.Clone(k)
 	u.mu.Lock()
 	traffic := u.mm[k]
 	traffic.Up += nr
@@ -192,7 +217,7 @@ func (u *MemoryUpstream) Consume(k string, nr, nw int64) error {
 	t.Value.Key = k
 	t.Value.Up = nr
 	t.Value.Down = nw
-	u.ch <- t
+	u.sendTask(t)
 	return nil
 }
 
@@ -237,7 +262,7 @@ func (u *CaddyUpstream) Add(s string) error {
 func (u *CaddyUpstream) Delete(s string) error {
 	b := [trojan.HeaderLen]byte{}
 	trojan.GenKey(s, b[:])
-	key := u.prefix + x.ByteSliceToString(b[:])
+	key := u.prefix + string(b[:])
 	if !u.storage.Exists(context.Background(), key) {
 		return nil
 	}
@@ -266,6 +291,7 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
 }
 
 func (u *CaddyUpstream) Validate(k string) bool {
+	time.Sleep(validateDelay)
 	key := u.prefix + k
 	return u.storage.Exists(context.Background(), key)
 }

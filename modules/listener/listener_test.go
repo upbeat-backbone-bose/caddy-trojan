@@ -24,9 +24,9 @@ func (fakeAddr) String() string  { return "127.0.0.1:0" }
 // acceptCh, push errors to errCh, or close the listener. It implements
 // net.Listener so it can be wrapped by Listener.
 type fakeListener struct {
-	acceptCh chan net.Conn
-	errCh    chan error
-	closed   chan struct{}
+	acceptCh  chan net.Conn
+	errCh     chan error
+	closed    chan struct{}
 	closeOnce sync.Once
 }
 
@@ -99,16 +99,16 @@ func newTestListener(fl *fakeListener) *Listener {
 // (the full-header path) which we do not want to exercise here.
 type noopUpstream struct{}
 
-func (noopUpstream) Add(string) error                  { return nil }
-func (noopUpstream) Delete(string) error               { return nil }
-func (noopUpstream) Range(func(string, int64, int64))  {}
-func (noopUpstream) Validate(string) bool              { return true }
+func (noopUpstream) Add(string) error                   { return nil }
+func (noopUpstream) Delete(string) error                { return nil }
+func (noopUpstream) Range(func(string, int64, int64))   {}
+func (noopUpstream) Validate(string) bool               { return true }
 func (noopUpstream) Consume(string, int64, int64) error { return nil }
 
 type noopProxy struct{}
 
-func (noopProxy) Close() error                              { return nil }
-func (noopProxy) Dial(string, string) (net.Conn, error)     { return nil, nil }
+func (noopProxy) Close() error                                        { return nil }
+func (noopProxy) Dial(string, string) (net.Conn, error)               { return nil, nil }
 func (noopProxy) ListenPacket(string, string) (net.PacketConn, error) { return nil, nil }
 
 var (
@@ -161,6 +161,52 @@ func TestListenerRewindLengthOnPartialRead(t *testing.T) {
 		t.Errorf("rewind length = %d bytes (% x), want exactly 1 byte (AA)", len(all), all)
 	} else if all[0] != 0xAA {
 		t.Errorf("rewind content = % x, want [AA]", all)
+	}
+}
+
+// TestListenerRewindOnInvalidCRLF verifies the CRLF terminator check added to
+// the full-header sniff path: after 56 key bytes, a malformed 0x0d/0x0a
+// terminator must rewind the connection to caddy (decoy path) instead of
+// entering HandleWithDialer.
+func TestListenerRewindOnInvalidCRLF(t *testing.T) {
+	t.Parallel()
+
+	fl := newFakeListener()
+	ln := newTestListener(fl)
+	defer ln.Close()
+	defer fl.Close()
+
+	// 56 key bytes followed by an invalid terminator (0x00 0x00), one byte
+	// per Read as the sniff loop reads b[n:n+1].
+	scripts := make([]fakeRead, trojan.HeaderLen+2)
+	for i := 0; i < trojan.HeaderLen; i++ {
+		scripts[i] = fakeRead{data: []byte{'x'}, err: nil}
+	}
+	scripts[trojan.HeaderLen] = fakeRead{data: []byte{0x00}, err: nil}
+	scripts[trojan.HeaderLen+1] = fakeRead{data: []byte{0x00}, err: nil}
+
+	conn := &fakeConn{scripts: scripts}
+	fl.acceptCh <- conn
+
+	go ln.loop()
+
+	var rewound net.Conn
+	select {
+	case rewound = <-ln.conns:
+	case <-time.After(2 * time.Second):
+		t.Fatal("listener did not rewind an invalid-CRLF conn within 2s")
+	}
+	defer rewound.Close()
+
+	all, err := io.ReadAll(rewound)
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(all) != trojan.HeaderLen+2 {
+		t.Fatalf("rewind length = %d, want %d", len(all), trojan.HeaderLen+2)
+	}
+	if all[trojan.HeaderLen] != 0x00 || all[trojan.HeaderLen+1] != 0x00 {
+		t.Errorf("rewind terminator = %#x %#x, want 0x00 0x00", all[trojan.HeaderLen], all[trojan.HeaderLen+1])
 	}
 }
 

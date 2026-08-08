@@ -215,7 +215,10 @@ func (l *Listener) loop() {
 			}
 
 			// check the net.Conn
-			if ok := up.Validate(x.ByteSliceToString(b[:trojan.HeaderLen])); !ok {
+			if b[trojan.HeaderLen] != 0x0d || b[trojan.HeaderLen+1] != 0x0a ||
+				!up.Validate(x.ByteSliceToString(b[:trojan.HeaderLen])) {
+				// Invalid CRLF terminator or unknown key: rewind and let caddy
+				// serve the connection as a normal (decoy) request.
 				select {
 				case <-l.closed:
 					c.Close()

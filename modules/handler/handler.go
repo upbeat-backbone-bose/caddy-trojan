@@ -147,6 +147,12 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			m.logger.Error(fmt.Sprintf("read trojan header error: %v", err))
 			return nil
 		}
+		// Reject a broken CRLF terminator consistently with the TCP path
+		// (pkgs/trojan validates it via errInvalidCRLF); a key-holding client
+		// with a malformed header would otherwise desynchronize the stream.
+		if b[trojan.HeaderLen] != 0x0d || b[trojan.HeaderLen+1] != 0x0a {
+			return nil
+		}
 		if ok := m.upstream.Validate(x.ByteSliceToString(b[:trojan.HeaderLen])); !ok {
 			return nil
 		}

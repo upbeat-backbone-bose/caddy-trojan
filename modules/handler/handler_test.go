@@ -49,6 +49,50 @@ func TestCheckOrigin(t *testing.T) {
 	}
 }
 
+// TestHandlerWebSocketRejectsInvalidCRLF verifies the CRLF terminator check in
+// the WebSocket path: a client that upgrades and sends 56 key bytes followed
+// by a malformed terminator must be rejected without panicking — and the
+// check runs before Validate, so even an unprovisioned handler (nil upstream)
+// is safe.
+func TestHandlerWebSocketRejectsInvalidCRLF(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		WebSocket:     true,
+		headerTimeout: 2 * time.Second,
+		logger:        zap.NewNop(),
+	}
+	h.upgrader.CheckOrigin = h.checkOrigin
+
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r, nil)
+		close(done)
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("upgrade failed: %v", err)
+	}
+	defer conn.Close()
+
+	// 56 key bytes + invalid CRLF (0x00 0x00).
+	header := append(make([]byte, 56), 0x00, 0x00)
+	if err := conn.WriteMessage(websocket.BinaryMessage, header); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+
+	select {
+	case <-done:
+		// good: the malformed terminator was rejected before Validate
+		// (upstream is nil in this test).
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after invalid CRLF; check placement of the check")
+	}
+}
+
 // TestHandlerWebSocketHeaderTimeoutFires is a regression test for the
 // headerTimeout fix in ServeHTTP: after a WebSocket upgrade, the handler
 // must bound how long it will wait for the trojan header. Without the

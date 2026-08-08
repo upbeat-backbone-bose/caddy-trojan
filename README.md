@@ -118,6 +118,39 @@ $ xcaddy build --with github.com/imgk/caddy-trojan
 curl -X POST -H "Content-Type: application/json" -d '{"password": "test1234"}' http://localhost:2019/trojan/users/add
 ```
 
+## Rate Limiting / DoS Hardening
+
+Password validation applies a uniform 250ms delay on every connection (hit and
+miss alike, to keep validation timing-constant). This means an unauthenticated
+peer can hold a server goroutine + file descriptor for ~250ms per connection by
+sending 58 bytes after the TLS handshake. Caddy itself has no built-in
+per-IP connection limiting, so add one at the edge:
+
+1. Bound connection lifetime in the server block so stalled peers are dropped:
+```
+servers :443 {
+	listener_wrappers {
+		trojan
+	}
+	read_timeout 30s
+	write_timeout 30s
+	idle_timeout 1m
+}
+```
+2. For per-IP connection concurrency limits, build caddy with a limiting
+plugin, e.g. [mholt/caddy-limit](https://github.com/mholt/caddy-limit):
+```
+xcaddy build --with github.com/mholt/caddy-limit
+```
+```
+servers :443 {
+	...
+	conn_limit 20
+}
+```
+3. As a last line of defense, use a firewall / fail2ban at the host level to
+cap new connections per source IP on port 443.
+
 ## Docker
 
 ```

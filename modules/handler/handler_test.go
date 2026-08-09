@@ -551,3 +551,52 @@ var (
 	_ app.Upstream = alwaysValidUpstream{}
 	_ app.Proxy    = (*eofOnFirstReadProxy)(nil)
 )
+
+// TestHandlerFailStateCleanupLoopDoesNotPanicOnTinyCooldown is a
+// defense-in-depth regression for the division-by-zero edge case in
+// cleanupLoop: cooldown/2 with time.Duration is integer division, so a
+// failCooldown below 2ns rounds interval to 0, which makes
+// time.NewTicker panic with "non-positive interval for NewTicker" and
+// crashes the test binary. Production uses connectFailCooldown = 60s
+// (never triggers), but the unexported failCooldown field has no floor
+// and a future test or config could pick a sub-nanosecond value. The fix
+// in cleanupLoop coerces interval to a sensible default when the
+// division rounds to zero; this test pins the behavior.
+//
+// We invoke cleanupLoop directly (not through recordFailure /
+// spawnCleanupLoop) so we can recover from any panic and assert on it
+// without terminating the test process.
+func TestHandlerFailStateCleanupLoopDoesNotPanicOnTinyCooldown(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		Connect:       true,
+		logger:        zap.NewNop(),
+		failThreshold: 1,
+		failWindow:    time.Hour,
+		failCooldown:  1, // 1 nanosecond: cooldown/2 == 0 without the guard
+	}
+	// Tell cleanupLoop to exit promptly.
+	done := make(chan struct{})
+	h.cleanupDone = make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("cleanupLoop panicked with cooldown=1ns: %v", r)
+			}
+		}()
+		h.cleanupLoop()
+	}()
+	// Let the goroutine reach NewTicker.
+	time.Sleep(20 * time.Millisecond)
+	// Cleanup must stop the goroutine and let it return cleanly.
+	if err := h.Cleanup(); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanupLoop did not exit after Cleanup")
+	}
+}

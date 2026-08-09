@@ -76,8 +76,10 @@ type Handler struct {
 	// failMu and failState implement the per-source rate limiter for the
 	// HTTP/2/3 CONNECT fast-fail path. nil until the first failure is
 	// observed.
-	failMu    sync.Mutex
-	failState map[string]*failRecord
+	failMu      sync.Mutex
+	failState   map[string]*failRecord
+	cleanupOnce sync.Once
+	cleanupDone chan struct{}
 }
 
 type failRecord struct {
@@ -168,9 +170,14 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		defer c.Close()
 
 		// Bound the trojan header read so an unauthenticated peer cannot
-		// hold this goroutine forever; the deadline is cleared on exit so
-		// the tunnel is not affected.
+		// hold this goroutine forever. The deadline MUST be cleared BEFORE
+		// HandleWithDialer; otherwise the headerTimeout (10s) would kill
+		// long-lived idle SSH-over-WS tunnels during normal idle gaps
+		// (SSH keepalive is typically 60s+). The defer below is the
+		// safety net for early-exit paths where the conn is being closed.
+		var headerConn net.Conn
 		if nc, ok := c.UnderlyingConn().(net.Conn); ok {
+			headerConn = nc
 			timeout := headerTimeout
 			if m.headerTimeout > 0 {
 				timeout = m.headerTimeout
@@ -179,6 +186,14 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			defer func() {
 				_ = nc.SetReadDeadline(time.Time{})
 			}()
+		}
+		// clearHeaderDeadline cancels the header-timeout on the current
+		// path. Call it before HandleWithDialer so the tunnel inherits
+		// no read deadline at all.
+		clearHeaderDeadline := func() {
+			if headerConn != nil {
+				_ = headerConn.SetReadDeadline(time.Time{})
+			}
 		}
 
 		b := [trojan.HeaderLen + 2]byte{}
@@ -195,6 +210,10 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		if ok := m.upstream.Validate(x.ByteSliceToString(b[:trojan.HeaderLen])); !ok {
 			return nil
 		}
+		// Header is fully read and validated. Cancel the header-timeout so
+		// the trojan tunnel (which will read/write the same net.Conn for
+		// the lifetime of the SSH session) has no deadline bleeding in.
+		clearHeaderDeadline()
 		if m.Verbose {
 			m.logger.Info(fmt.Sprintf("handle trojan websocket.Conn from %v", r.RemoteAddr))
 		}
@@ -281,6 +300,7 @@ var (
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ caddyfile.Unmarshaler       = (*Handler)(nil)
+	_ caddy.CleanerUpper          = (*Handler)(nil)
 )
 
 type FlushWriter struct {
@@ -328,9 +348,11 @@ func (m *Handler) failCfg() (threshold int, window, cooldown time.Duration) {
 // that does not yield a validated user — wrong-length auth header, bad
 // password, or upstream lookup failure.
 //
-// Garbage collection: entries with no recent failures are pruned lazily
-// on the next access from the same address; bounded by the connect window
-// (10s by default) the worst-case memory is O(uniques-addr-in-window).
+// Garbage collection: a background cleanup goroutine (spawnCleanupLoop,
+// one per Handler) drops entries whose firstFailure is older than the
+// cooldown, so single-failure entries from unique addresses cannot
+// accumulate unboundedly; isRateLimited also prunes lazily on access.
+// Cleanup() stops the goroutine when the handler is unloaded.
 func (m *Handler) recordFailure(addr string) {
 	if addr == "" {
 		return
@@ -339,6 +361,7 @@ func (m *Handler) recordFailure(addr string) {
 	if threshold <= 0 {
 		return
 	}
+	m.spawnCleanupLoop()
 	m.failMu.Lock()
 	defer m.failMu.Unlock()
 	if m.failState == nil {
@@ -381,9 +404,89 @@ func (m *Handler) isRateLimited(addr string) bool {
 	if time.Now().Before(rec.blockedUntil) {
 		return true
 	}
-	// Cooldown elapsed: clear so legitimate retries are not punished.
-	rec.blockedUntil = time.Time{}
-	rec.count = 0
-	rec.firstFailure = time.Time{}
+	// Cooldown elapsed: clear and drop the entry so the map doesn't grow
+	// unbounded as unique-source attackers (or buggy clients) accumulate
+	// dead records.
+	delete(m.failState, addr)
 	return false
+}
+
+// Cleanup stops the background cleanup goroutine and releases the
+// failState map. Called by caddy when the handler is being unloaded.
+func (m *Handler) Cleanup() error {
+	m.failMu.Lock()
+	if m.cleanupDone != nil {
+		select {
+		case <-m.cleanupDone:
+		default:
+			close(m.cleanupDone)
+		}
+	}
+	m.failState = nil
+	m.failMu.Unlock()
+	return nil
+}
+
+// spawnCleanupLoop starts one background goroutine per Handler that
+// periodically drops expired entries from failState. Without this, an
+// attacker who fails Validate once from each of N unique RemoteAddrs
+// would exhaust memory (O(N) entries, never freed).
+func (m *Handler) spawnCleanupLoop() {
+	m.cleanupOnce.Do(func() {
+		m.cleanupDone = make(chan struct{})
+		go m.cleanupLoop()
+	})
+}
+
+// cleanupLoop is the body of the background cleanup goroutine. It runs
+// until cleanupDone is closed by Cleanup. Tick interval is cooldown/2,
+// clamped to at most 1 minute so a misconfigured very-large cooldown
+// still gets cleaned up in bounded time. There is intentionally no lower
+// bound: tests shrink the cooldown to milliseconds and want fast ticks,
+// and the production constant (60s) gives a comfortable 30s interval.
+//
+// Defensive: cooldown/2 with integer-divided time.Duration rounds to 0
+// when cooldown < 2ns. Production uses connectFailCooldown = 60s so this
+// can't happen; the unexported failCooldown field is test-injectable
+// with no floor, so a future test or config that picks a tiny value would
+// otherwise panic time.NewTicker with "non-positive interval". The
+// explicit guard coerces to a sensible 1s default in that pathological
+// case.
+func (m *Handler) cleanupLoop() {
+	_, _, cooldown := m.failCfg()
+	interval := cooldown / 2
+	if interval <= 0 {
+		interval = time.Second
+	}
+	if interval > time.Minute {
+		interval = time.Minute
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.cleanupDone:
+			return
+		case <-t.C:
+			m.cleanupTick(time.Now())
+		}
+	}
+}
+
+// cleanupTick removes entries whose firstFailure is older than the
+// cooldown. This covers both stale single-failure entries (never
+// reached the rate-limit threshold) and entries whose cooldown has
+// already elapsed but weren't visited again by isRateLimited.
+func (m *Handler) cleanupTick(now time.Time) {
+	_, _, cooldown := m.failCfg()
+	m.failMu.Lock()
+	defer m.failMu.Unlock()
+	if m.failState == nil {
+		return
+	}
+	for addr, rec := range m.failState {
+		if !rec.firstFailure.IsZero() && now.Sub(rec.firstFailure) > cooldown {
+			delete(m.failState, addr)
+		}
+	}
 }

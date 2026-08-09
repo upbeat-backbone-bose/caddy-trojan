@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +14,9 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+
+	"github.com/imgk/caddy-trojan/app"
+	"github.com/imgk/caddy-trojan/pkgs/trojan"
 )
 
 func TestCheckOrigin(t *testing.T) {
@@ -175,12 +181,12 @@ func TestHandlerConnectRateLimitsAfterRepeatedFailures(t *testing.T) {
 	up := &countingUpstream{fail: true}
 
 	h := &Handler{
-		Connect: true,
-		upstream: up,
-		logger:  zap.NewNop(),
-		failThreshold:           1,
-		failWindow:              1 * time.Hour, // long enough to stay tripped
-		failCooldown:            1 * time.Hour,
+		Connect:       true,
+		upstream:      up,
+		logger:        zap.NewNop(),
+		failThreshold: 1,
+		failWindow:    1 * time.Hour, // long enough to stay tripped
+		failCooldown:  1 * time.Hour,
 	}
 
 	// Helper: build a CONNECT request that simulates HTTP/2 by setting
@@ -229,9 +235,9 @@ func TestHandlerConnectDoesNotRateLimitValidKey(t *testing.T) {
 
 	up := &countingUpstream{fail: false} // always succeed
 	h := &Handler{
-		Connect: true,
-		upstream: up,
-		logger:  zap.NewNop(),
+		Connect:       true,
+		upstream:      up,
+		logger:        zap.NewNop(),
 		failThreshold: 1,
 		failWindow:    1 * time.Hour,
 		failCooldown:  1 * time.Hour,
@@ -265,9 +271,9 @@ func TestHandlerConnectRateLimitResetsAfterCooldown(t *testing.T) {
 
 	up := &countingUpstream{fail: true}
 	h := &Handler{
-		Connect: true,
-		upstream: up,
-		logger:  zap.NewNop(),
+		Connect:       true,
+		upstream:      up,
+		logger:        zap.NewNop(),
 		failThreshold: 1,
 		failWindow:    1 * time.Hour,
 		failCooldown:  10 * time.Millisecond,
@@ -317,7 +323,7 @@ func TestHandlerRateLimitWindowResets(t *testing.T) {
 	const addr = "192.0.2.1:1234"
 
 	h := &Handler{
-		Connect:      true,
+		Connect:       true,
 		upstream:      &countingUpstream{fail: true},
 		logger:        zap.NewNop(),
 		failThreshold: 3,
@@ -360,4 +366,188 @@ func TestHandlerRateLimitWindowResets(t *testing.T) {
 	}
 }
 
+// TestHandlerFailStateCleanupBoundsMemory is a regression test for the
+// failState memory leak: the map previously grew unbounded as unique
+// RemoteAddrs accumulated single-failure entries that were never deleted
+// (the only deletion path was isRateLimited's lazy clear, which only
+// fired when the same address came back within the cooldown window —
+// single-failure entries never triggered it).
+//
+// Method: drive the rate limiter with a unique address that fails once
+// and never returns. After the cooldown elapses, a background cleanup
+// goroutine (spawned by recordFailure) must remove the entry. We assert
+// failState is empty after the cooldown.
+//
+// The test uses tiny cooldown/window values to keep the suite fast, and
+// Cleanup() at the end so the background goroutine doesn't outlive the
+// test (which would otherwise leak into the test binary).
+func TestHandlerFailStateCleanupBoundsMemory(t *testing.T) {
+	t.Parallel()
 
+	h := &Handler{
+		Connect:       true,
+		upstream:      &countingUpstream{fail: true},
+		logger:        zap.NewNop(),
+		failThreshold: 1,
+		failWindow:    10 * time.Millisecond,
+		failCooldown:  30 * time.Millisecond,
+	}
+	t.Cleanup(func() { _ = h.Cleanup() })
+
+	badAuth := "Basic " + strings.Repeat("0", 56)
+	newReq := func() *http.Request {
+		r := httptest.NewRequest(http.MethodConnect, "https://example.com:443/", nil)
+		r.ProtoMajor = 2
+		r.RemoteAddr = "192.0.2.42:9999" // unique address for this test
+		r.Header.Set("Proxy-Authorization", badAuth)
+		return r
+	}
+	next := caddyhttp.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) error { return nil })
+
+	// One failure: recordFailure creates the entry AND spawns the cleanup
+	// goroutine.
+	if err := h.ServeHTTP(httptest.NewRecorder(), newReq(), next); err != nil {
+		t.Fatalf("ServeHTTP error: %v", err)
+	}
+
+	// The entry must exist immediately after the failure.
+	h.failMu.Lock()
+	beforeCount := len(h.failState)
+	h.failMu.Unlock()
+	if beforeCount != 1 {
+		t.Fatalf("failState has %d entries after one failure; want 1", beforeCount)
+	}
+
+	// Wait for cleanup tick (cooldown/2 = 15ms) plus the cooldown itself
+	// (30ms) plus generous slack. The cleanup goroutine runs every
+	// cooldown/2 (clamped to >=1s for the production default, but with the
+	// 30ms cooldown we use here it ticks every 15ms).
+	time.Sleep(150 * time.Millisecond)
+
+	// The cleanup goroutine must have removed the entry: its firstFailure
+	// is older than the cooldown.
+	h.failMu.Lock()
+	afterCount := len(h.failState)
+	h.failMu.Unlock()
+	if afterCount != 0 {
+		t.Errorf("failState has %d entries after cooldown + tick; want 0 (cleanup goroutine not running or not deleting)", afterCount)
+	}
+}
+
+// TestHandlerWebSocketHeaderDeadlineDoesNotLeakIntoTunnel is the
+// handler-side counterpart of TestListenerClearsSniffDeadlineBeforeTunnel.
+// The WebSocket upgrade path also sets a 10s header-timeout deadline on
+// the underlying conn; without the fix, that deadline bled into the
+// trojan tunnel (HandleWithDialer) and killed long-lived idle SSH-over-WS
+// tunnels during normal idle gaps.
+//
+// Method: stand up an httptest.Server, upgrade to WebSocket, send a
+// valid trojan header + HandleWithDialer request, then wait longer than
+// headerTimeout and verify the WebSocket is still alive (i.e. the handler
+// has not exited due to a leaked deadline firing inside the tunnel).
+// We use a stub "server" conn that returns EOF immediately, which forces
+// HandleTCP's main goroutine into the err==nil branch (so the wakeGrace
+// deadline applies — without the fix, the header timeout fires first).
+func TestHandlerWebSocketHeaderDeadlineDoesNotLeakIntoTunnel(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		WebSocket:     true,
+		headerTimeout: 100 * time.Millisecond,
+		logger:        zap.NewNop(),
+		upstream:      alwaysValidUpstream{},
+		proxy:         &eofOnFirstReadProxy{},
+	}
+	h.upgrader.CheckOrigin = h.checkOrigin
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r, nil)
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("upgrade failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Send trojan header (56 key bytes + 0x0d 0x0a).
+	header := make([]byte, trojan.HeaderLen)
+	for i := range header {
+		header[i] = 'x'
+	}
+	header = append(header, 0x0d, 0x0a)
+	if err := conn.WriteMessage(websocket.BinaryMessage, header); err != nil {
+		t.Fatalf("write trojan header: %v", err)
+	}
+
+	// Send HandleWithDialer bytes: CMD=Connect, ATYP=IPv4, 127.0.0.1:22, CRLF.
+	cmd := []byte{0x01, 0x01, 127, 0, 0, 1, 0x00, 0x16, 0x0d, 0x0a}
+	if err := conn.WriteMessage(websocket.BinaryMessage, cmd); err != nil {
+		t.Fatalf("write cmd: %v", err)
+	}
+
+	// Wait > headerTimeout (100ms). Without the fix, the leaked deadline
+	// would fire on the WS conn inside HandleTCP's client→server copy,
+	// HandleTCP would return, the handler would defer-Close the WS, and
+	// the conn would be closed within ~100ms.
+	time.Sleep(300 * time.Millisecond)
+
+	// Try to read with a 50ms deadline. If the tunnel is alive, the read
+	// times out (no data flowing). If the tunnel is dead (bug), the read
+	// returns a non-timeout error (e.g., connection closed).
+	if err := conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatal("WS read returned without error; unexpected (no data is flowing)")
+	}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		// Good: WebSocket is alive but no data flowing. The header
+		// deadline was cleared before HandleWithDialer.
+		return
+	}
+	t.Errorf("WS read returned non-timeout error after headerTimeout+epsilon: %v (header deadline likely leaked into tunnel)", err)
+}
+
+// alwaysValidUpstream satisfies app.Upstream with no rate-limiting delay
+// (Validate returns true instantly). Used by handler WebSocket tests so
+// the validateDelay does not push past the headerTimeout.
+type alwaysValidUpstream struct{}
+
+func (alwaysValidUpstream) Validate(string) bool               { return true }
+func (alwaysValidUpstream) Consume(string, int64, int64) error { return nil }
+func (alwaysValidUpstream) Add(string) error                   { return nil }
+func (alwaysValidUpstream) Delete(string) error                { return nil }
+func (alwaysValidUpstream) Range(func(string, int64, int64))   {}
+
+// eofOnFirstReadProxy is a stub Proxy whose Dial returns a net.Conn that
+// returns io.EOF on the first Read and succeeds on Write. This drives
+// HandleTCP into the err==nil branch immediately and keeps the other
+// goroutine blocked on Read from the client, so the handler stays alive
+// until either (a) the test ends, or (b) a leaked deadline fires.
+type eofOnFirstReadProxy struct{}
+
+func (*eofOnFirstReadProxy) Close() error                       { return nil }
+func (*eofOnFirstReadProxy) Dial(_, _ string) (net.Conn, error) { return &eofConn{}, nil }
+func (*eofOnFirstReadProxy) ListenPacket(_, _ string) (net.PacketConn, error) {
+	return nil, errors.New("not supported")
+}
+
+type eofConn struct{}
+
+func (*eofConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (*eofConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (*eofConn) Close() error                     { return nil }
+func (*eofConn) LocalAddr() net.Addr              { return nil }
+func (*eofConn) RemoteAddr() net.Addr             { return nil }
+func (*eofConn) SetDeadline(time.Time) error      { return nil }
+func (*eofConn) SetReadDeadline(time.Time) error  { return nil }
+func (*eofConn) SetWriteDeadline(time.Time) error { return nil }
+
+var (
+	_ app.Upstream = alwaysValidUpstream{}
+	_ app.Proxy    = (*eofOnFirstReadProxy)(nil)
+)

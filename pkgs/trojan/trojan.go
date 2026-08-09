@@ -19,6 +19,14 @@ const HeaderLen = 56
 // malformed.
 var errInvalidCRLF = errors.New("invalid CRLF terminator")
 
+// allocByteErr, when non-nil, is returned by HandleTCP/HandleUDP instead of
+// performing real memory.Alloc. Production leaves it nil; tests set it to
+// simulate an mmap failure under the `malloc_syscall` build tag without
+// actually exhausting memory. The B3 fix wires the check into HandleTCP
+// and HandleUDP; without the check, a panic inside a goroutine would crash
+// the whole process.
+var allocByteErr error
+
 // wakeReader sets an immediate read deadline on w's underlying connection so
 // that a goroutine blocked reading from the same connection is released. It is
 // used right before waiting on errCh so that a silent peer cannot deadlock

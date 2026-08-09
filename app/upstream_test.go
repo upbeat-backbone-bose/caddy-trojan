@@ -225,8 +225,16 @@ func TestCaddyUpstreamValidateAppliesDelay(t *testing.T) {
 // memStorage is a minimal in-memory certmagic.Storage used only by tests.
 // It implements the subset of the interface CaddyUpstream touches: Store,
 // Load, Delete, Exists, List, Stat, plus Lock/Unlock from Locker.
+//
+// storeCount / loadCount / existsCount record how many times each operation
+// was hit, and lastKey tracks the most recent key seen. Tests that need to
+// assert "no I/O" on a given call inspect these counters before vs. after.
 type memStorage struct {
-	data map[string][]byte
+	data       map[string][]byte
+	storeCount int
+	loadCount  int
+	existsCount int
+	lastKey    string
 }
 
 func newMemStorage() *memStorage {
@@ -234,11 +242,15 @@ func newMemStorage() *memStorage {
 }
 
 func (m *memStorage) Store(_ context.Context, key string, value []byte) error {
+	m.storeCount++
+	m.lastKey = key
 	m.data[key] = value
 	return nil
 }
 
 func (m *memStorage) Load(_ context.Context, key string) ([]byte, error) {
+	m.loadCount++
+	m.lastKey = key
 	v, ok := m.data[key]
 	if !ok {
 		return nil, nil
@@ -252,6 +264,8 @@ func (m *memStorage) Delete(_ context.Context, key string) error {
 }
 
 func (m *memStorage) Exists(_ context.Context, key string) bool {
+	m.existsCount++
+	m.lastKey = key
 	_, ok := m.data[key]
 	return ok
 }
@@ -276,3 +290,241 @@ func (m *memStorage) Stat(_ context.Context, key string) (certmagic.KeyInfo, err
 
 func (m *memStorage) Lock(_ context.Context, _ string) error   { return nil }
 func (m *memStorage) Unlock(_ context.Context, _ string) error { return nil }
+
+// TestCaddyUpstreamValidHexKeyStillWorks is regression armor for the storage
+// key validation fix: the legitimate path stores hex SHA224 digests via
+// trojan.GenKey, which always produces 56 lowercase hex characters. After
+// validation is added, that path must remain operational. This test passes
+// both pre-fix (current code accepts anything) and post-fix (validator
+// accepts the legit format).
+func TestCaddyUpstreamValidHexKeyStillWorks(t *testing.T) {
+	t.Parallel()
+
+	store := newMemStorage()
+	u := &CaddyUpstream{prefix: "trojan/", storage: store}
+
+	const pw = "pass1234"
+	if err := u.Add(pw); err != nil {
+		t.Fatalf("Add error: %v", err)
+	}
+
+	var key string
+	u.Range(func(k string, _, _ int64) {
+		key = k
+	})
+	if l := len(key); l != trojan.HeaderLen {
+		t.Fatalf("Add produced key of length %d, want %d", l, trojan.HeaderLen)
+	}
+	for _, c := range key {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			t.Fatalf("Add produced non-hex key char %q in %q", c, key)
+		}
+	}
+
+	if !u.Validate(key) {
+		t.Error("Validate(legit hex key) = false, want true")
+	}
+	if err := u.Consume(key, 100, 200); err != nil {
+		t.Errorf("Consume on legit hex key = %v, want nil", err)
+	}
+}
+
+// TestCaddyUpstreamRejectsPathTraversal verifies that Validate/Consume reject
+// keys containing "../" segments or absolute-path components before touching
+// the underlying storage. Without this, an attacker who controls the trojan
+// header can read Exists on (and even create/overwrite arbitrary storage
+// paths) outside the configured prefix.
+//
+// Pre-fix the code does `key := u.prefix + k` and passes the joined string
+// straight to certmagic.FileStorage, whose Filename() uses filepath.Join —
+// that escapes the prefix on "..". The test plants a "bait" value at the
+// exfiltrated path and asserts post-fix that Exists never sees the path and
+// Consume never creates/overwrites it.
+func TestCaddyUpstreamRejectsPathTraversal(t *testing.T) {
+	t.Parallel()
+
+	store := newMemStorage()
+	u := &CaddyUpstream{prefix: "trojan/", storage: store}
+
+	// Seed a legitimate user so the storage isn't empty (and so Consume has a
+	// real, separate, side-effect-free key to contrast with the attack).
+	if err := u.Add("pass1234"); err != nil {
+		t.Fatalf("seed Add: %v", err)
+	}
+	loadBefore := store.loadCount
+	storeBefore := store.storeCount
+	existsBefore := store.existsCount
+
+	// Attack vectors: 56-byte keys whose ../ or absolute components would
+	// escape the "trojan/" prefix once joined. Each must be rejected without
+	// any I/O (load/store/exists counters unchanged).
+	attacks := []struct {
+		name string
+		key  string
+	}{
+		{"relative_traversal", "../../../etc/passwd" + "/foo"},                  // pad to 56 to satisfy len == HeaderLen check is NOT done in fix; instead, fix rejects ALL non-hex regardless of length
+		{"too_short_traversal", "../bad"},
+		{"absolute_path_traversal", strings.Repeat("/a", 28)}, // 56 bytes of /a chars
+		{"single_dot_segment", ".."},
+	}
+
+	for _, at := range attacks {
+		at := at
+		t.Run("Validate_"+at.name, func(t *testing.T) {
+			t.Parallel()
+			store := newMemStorage()
+			u := &CaddyUpstream{prefix: "trojan/", storage: store}
+			if err := u.Add("pass1234"); err != nil {
+				t.Fatalf("seed Add: %v", err)
+			}
+			existsBefore := store.existsCount
+			if u.Validate(at.key) {
+				t.Errorf("Validate(%q) = true; path traversal must be rejected", at.key)
+			}
+			if store.existsCount != existsBefore {
+				t.Errorf("Validate(%q) caused %d extra Exists calls; must short-circuit before I/O", at.key, store.existsCount-existsBefore)
+			}
+		})
+		t.Run("Consume_"+at.name, func(t *testing.T) {
+			t.Parallel()
+			store := newMemStorage()
+			u := &CaddyUpstream{prefix: "trojan/", storage: store}
+			if err := u.Add("pass1234"); err != nil {
+				t.Fatalf("seed Add: %v", err)
+			}
+			loadBefore := store.loadCount
+			storeBefore := store.storeCount
+			if err := u.Consume(at.key, 1, 2); err == nil {
+				t.Errorf("Consume(%q) = nil; path traversal must be rejected with an error", at.key)
+			}
+			if store.loadCount != loadBefore || store.storeCount != storeBefore {
+				t.Errorf("Consume(%q) caused extra I/O (load +%d, store +%d); must short-circuit before I/O", at.key, store.loadCount-loadBefore, store.storeCount-storeBefore)
+			}
+		})
+	}
+
+	// Final sanity: the seed user's load/store counters are untouched.
+	if store.loadCount != loadBefore {
+		t.Errorf("seed-side extra loads observed: %d", store.loadCount-loadBefore)
+	}
+	if store.storeCount != storeBefore {
+		t.Errorf("seed-side extra stores observed: %d", store.storeCount-storeBefore)
+	}
+	if store.existsCount != existsBefore {
+		t.Errorf("seed-side extra exists observed: %d", store.existsCount-existsBefore)
+	}
+}
+
+// TestCaddyUpstreamRejectsWrongLength verifies Validate/Consume reject keys
+// whose length does not match trojan.HeaderLen. The trojan header is a
+// fixed-size 56-byte hex SHA224 digest; anything else is input from an
+// invalid client or a misuse of the Upstream API.
+func TestCaddyUpstreamRejectsWrongLength(t *testing.T) {
+	t.Parallel()
+
+	for _, l := range []int{0, 1, 55, 57, 128, 1024} {
+		key := strings.Repeat("a", l)
+		t.Run("Validate_len_"+itoa(l), func(t *testing.T) {
+			t.Parallel()
+			store := newMemStorage()
+			u := &CaddyUpstream{prefix: "trojan/", storage: store}
+			existsBefore := store.existsCount
+			if u.Validate(key) {
+				t.Errorf("Validate(key of len %d) = true; want false", l)
+			}
+			if store.existsCount != existsBefore {
+				t.Errorf("Validate(len %d) caused extra Exists; must short-circuit", l)
+			}
+		})
+		t.Run("Consume_len_"+itoa(l), func(t *testing.T) {
+			t.Parallel()
+			store := newMemStorage()
+			u := &CaddyUpstream{prefix: "trojan/", storage: store}
+			loadBefore := store.loadCount
+			storeBefore := store.storeCount
+			if err := u.Consume(key, 1, 2); err == nil {
+				t.Errorf("Consume(key of len %d) = nil; want error", l)
+			}
+			if store.loadCount != loadBefore || store.storeCount != storeBefore {
+				t.Errorf("Consume(len %d) caused extra I/O", l)
+			}
+		})
+	}
+}
+
+// TestCaddyUpstreamRejectsNonHexChars verifies Validate/Consume reject keys
+// of correct length but containing any byte outside [0-9a-f]. The hex encoder
+// only emits lowercase chars; uppercase, spaces, slashes, dots, and other
+// bytes are by definition not produced by the legitimate code path and must
+// not be accepted. The "../" traversal key is the most important instance:
+// 56 bytes of '2e' (.) before the prefix-escape point.
+func TestCaddyUpstreamRejectsNonHexChars(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		key  string
+	}{
+		{"all_slashes", strings.Repeat("/", trojan.HeaderLen)},
+		{"all_dots", strings.Repeat(".", trojan.HeaderLen)},       // "../../../../..."
+		{"uppercase_hex", strings.Repeat("A", trojan.HeaderLen)},
+		{"mixed_with_2e", "../" + strings.Repeat("a", trojan.HeaderLen-3)},
+		{"space_padded", strings.Repeat(" ", trojan.HeaderLen)},
+		{"traversal_56", strings.Repeat("../", 56/3) + strings.Repeat("/", 56-2*(56/3))},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run("Validate_"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			store := newMemStorage()
+			u := &CaddyUpstream{prefix: "trojan/", storage: store}
+			existsBefore := store.existsCount
+			if u.Validate(tc.key) {
+				t.Errorf("Validate(%s, len=%d) = true; want false", tc.name, len(tc.key))
+			}
+			if store.existsCount != existsBefore {
+				t.Errorf("Validate(%s) caused extra Exists; must short-circuit", tc.name)
+			}
+		})
+		t.Run("Consume_"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			store := newMemStorage()
+			u := &CaddyUpstream{prefix: "trojan/", storage: store}
+			loadBefore := store.loadCount
+			storeBefore := store.storeCount
+			if err := u.Consume(tc.key, 1, 2); err == nil {
+				t.Errorf("Consume(%s) = nil; want error", tc.name)
+			}
+			if store.loadCount != loadBefore || store.storeCount != storeBefore {
+				t.Errorf("Consume(%s) caused extra I/O", tc.name)
+			}
+		})
+	}
+}
+
+// itoa is a tiny local helper to format an int into a string for subtest
+// names without pulling strconv into a test-only suffix.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := false
+	if n < 0 {
+		neg = true
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}
+

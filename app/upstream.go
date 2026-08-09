@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -38,6 +39,31 @@ type Upstream interface {
 // from an observer's perspective: it raises the cost of online password
 // guessing and removes the success/failure timing signal.
 const validateDelay = 250 * time.Millisecond
+
+// errInvalidStorageKey is returned by Upstream methods when a key fails the
+// validStorageKey check. Storage keys that escape this check (wrong length,
+// non-hex bytes, "../" segments, absolute paths) are rejected before any
+// storage I/O so they cannot bypass authentication or overwrite JSON files
+// outside the configured prefix via filepath.Join on certmagic.FileStorage.
+var errInvalidStorageKey = errors.New("invalid storage key")
+
+// validStorageKey reports whether k is a safe hex SHA224 digest suitable for
+// use as a certmagic.Storage key. The legitimate code path always produces
+// 56 bytes of lowercase hex (see trojan.GenKey); anything else — wrong
+// length, non-hex bytes, "../" or absolute-path components — is rejected at
+// the Upstream boundary so it cannot reach the storage layer.
+func validStorageKey(k string) bool {
+	if len(k) != trojan.HeaderLen {
+		return false
+	}
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
 
 type TaskType int
 
@@ -291,12 +317,22 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
 }
 
 func (u *CaddyUpstream) Validate(k string) bool {
+	if !validStorageKey(k) {
+		// Reject attack vectors (wrong length, non-hex, "../") without any
+		// storage I/O. The constant-time delay is intentionally NOT applied:
+		// these aren't password-guessing attempts — they're injection probes,
+		// and an attacker already knows whether their key is well-formed.
+		return false
+	}
 	time.Sleep(validateDelay)
 	key := u.prefix + k
 	return u.storage.Exists(context.Background(), key)
 }
 
 func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
+	if !validStorageKey(k) {
+		return fmt.Errorf("consume %q: %w", k, errInvalidStorageKey)
+	}
 	key := u.prefix + k
 
 	u.storage.Lock(context.Background(), key)

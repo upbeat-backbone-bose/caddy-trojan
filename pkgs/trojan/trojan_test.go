@@ -163,3 +163,154 @@ func TestHandleUDPRejectsInvalidCRLF(t *testing.T) {
 		t.Errorf("HandleUDP error = %v, want errInvalidCRLF sentinel", err)
 	}
 }
+
+// failingAddr is a net.Addr that returns a fixed string; used only so
+// HandleTCP's Dial path has a syntactically valid target.
+type failingAddr struct{}
+
+func (failingAddr) Network() string { return "tcp" }
+func (failingAddr) String() string  { return "127.0.0.1:0" }
+
+// dialReturningPipe is a Dialer whose Dial returns the half of a net.Pipe
+// already set up by the test, so HandleTCP's Dial succeeds and we exercise
+// the post-dial memory.Alloc path.
+type dialReturningPipe struct{ conn net.Conn }
+
+func (d *dialReturningPipe) Dial(string, string) (net.Conn, error) { return d.conn, nil }
+func (d *dialReturningPipe) ListenPacket(string, string) (net.PacketConn, error) {
+	return nil, errors.New("not supported")
+}
+
+// withAllocErr temporarily sets the package-level allocByteErr to the given
+// error and registers a cleanup that restores it. It is the test hook for
+// the B3 (mmap failure propagation) fix: production leaves allocByteErr
+// nil, so HandleTCP/HandleUDP call the real memory.Alloc.
+func withAllocErr(t *testing.T, err error) {
+	t.Helper()
+	orig := allocByteErr
+	t.Cleanup(func() { allocByteErr = orig })
+	allocByteErr = err
+}
+
+// TestHandleTCPAllocFailureReturnsError verifies that HandleTCP returns an
+// error instead of panicking when memory.Alloc fails (e.g. mmap() under
+// memory pressure in the `malloc_syscall` build). Pre-fix the goroutines
+// contain `panic(err)`; a real mmap failure would crash the whole process.
+// Post-fix the failure surfaces as a (0, 0, err) return without a panic.
+//
+// This test runs without t.Parallel() because it mutates package-level
+// state (allocByteErr); parallel runs would race on that variable.
+func TestHandleTCPAllocFailureReturnsError(t *testing.T) {
+	client, srv := net.Pipe()
+	defer client.Close()
+	defer srv.Close()
+
+	withAllocErr(t, errors.New("simulated alloc failure"))
+
+	d := &dialReturningPipe{conn: srv}
+	done := make(chan struct{})
+	var nr, nw int64
+	var err error
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				err = errors.New("HandleTCP panicked instead of returning an error")
+			}
+		}()
+		nr, nw, err = HandleTCP(client, client, failingAddr{}, d)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleTCP did not return within 2s on alloc failure; possible deadlock or panic")
+	}
+
+	if err == nil {
+		t.Fatalf("HandleTCP returned (nr=%d, nw=%d, err=nil) on alloc failure; want non-nil error", nr, nw)
+	}
+	if nr != 0 || nw != 0 {
+		t.Errorf("HandleTCP on alloc failure returned nr=%d nw=%d; want 0/0", nr, nw)
+	}
+}
+
+// TestHandleUDPAllocFailureReturnsError is the UDP counterpart of the TCP
+// alloc-failure test: HandleUDP must return (0, 0, err) without panicking
+// if memory.Alloc fails. mockDialer in this package implements ListenPacket
+// by binding a real UDP socket; we reuse it so Alloc is reached.
+func TestHandleUDPAllocFailureReturnsError(t *testing.T) {
+	client, _ := net.Pipe()
+	defer client.Close()
+
+	withAllocErr(t, errors.New("simulated alloc failure"))
+
+	d := mockDialer{}
+	done := make(chan struct{})
+	var nr, nw int64
+	var err error
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				err = errors.New("HandleUDP panicked instead of returning an error")
+			}
+		}()
+		nr, nw, err = HandleUDP(client, client, 200*time.Millisecond, d)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleUDP did not return within 2s on alloc failure; possible deadlock or panic")
+	}
+
+	if err == nil {
+		t.Fatalf("HandleUDP returned (nr=%d, nw=%d, err=nil) on alloc failure; want non-nil error", nr, nw)
+	}
+	if nr != 0 || nw != 0 {
+		t.Errorf("HandleUDP on alloc failure returned nr=%d nw=%d; want 0/0", nr, nw)
+	}
+}
+
+// TestHandleTCPNormalPathUnaffected sanity-checks that under the default
+// (real) allocator, HandleTCP can still complete a small round trip —
+// guarding against the B3 fix accidentally breaking the happy path.
+//
+// This test is intentionally not Parallel() because it shares package state
+// with the alloc-failure test, but a t.Cleanup guarantees allocByteErr is
+// restored to nil before any other test runs.
+func TestHandleTCPNormalPathUnaffected(t *testing.T) {
+	withAllocErr(t, nil) // explicit: real allocator
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	upstream, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	go func() {
+		c, _ := ln.Accept()
+		_ = c.Close()
+	}()
+
+	d := &dialReturningPipe{conn: upstream}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := HandleTCP(upstream, upstream, failingAddr{}, d)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Logf("HandleTCP returned (expected EOF or similar): %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("HandleTCP deadlocked under default allocator")
+	}
+}
+

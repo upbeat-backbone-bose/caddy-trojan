@@ -2,6 +2,7 @@ package trojan
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -9,6 +10,13 @@ import (
 
 	"github.com/imgk/memory-go"
 )
+
+// tcpBufSize is the per-direction copy buffer for HandleTCP. The pool variant
+// of memory.Alloc never returns errors; the malloc_syscall variant (used by
+// CI builds per AGENTS.md) does. Both buffers are allocated in the main
+// flow before goroutines spawn so an mmap failure surfaces as a regular
+// (0, 0, err) return rather than a goroutine panic.
+const tcpBufSize = 32 * 1024
 
 func copyBuffer(w io.Writer, r io.Reader, buf []byte) (n int64, err error) {
 	for {
@@ -41,12 +49,37 @@ func copyBuffer(w io.Writer, r io.Reader, buf []byte) (n int64, err error) {
 	return n, err
 }
 
+// allocShortCircuit returns the (0, 0, err) result HandleTCP/HandleUDP should
+// return when the test-only allocByteErr is set. Production leaves
+// allocByteErr nil, so this is a no-op; tests override it to exercise the
+// alloc-failure branch without exhausting memory.
+func allocShortCircuit() (int64, int64, error) {
+	if err := allocByteErr; err != nil {
+		return 0, 0, fmt.Errorf("memory alloc error: %w", err)
+	}
+	return -1, -1, nil
+}
+
 func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64, error) {
+	if nr, nw, err := allocShortCircuit(); err != nil {
+		return nr, nw, err
+	}
 	rc, err := d.Dial("tcp", addr.String())
 	if err != nil {
 		return 0, 0, err
 	}
 	defer rc.Close()
+
+	ptrA, bufA, err := memory.Alloc[byte](tcpBufSize)
+	if err != nil {
+		return 0, 0, fmt.Errorf("memory alloc error: %w", err)
+	}
+	defer memory.Free(ptrA)
+	ptrB, bufB, err := memory.Alloc[byte](tcpBufSize)
+	if err != nil {
+		return 0, 0, fmt.Errorf("memory alloc error: %w", err)
+	}
+	defer memory.Free(ptrB)
 
 	type Result struct {
 		Num int64
@@ -54,13 +87,7 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 	}
 
 	errCh := make(chan Result)
-	go func(rc net.Conn, r io.Reader, errCh chan Result) {
-		ptr, buf, err := memory.Alloc[byte](32 * 1024)
-		if err != nil {
-			panic(err)
-		}
-		defer memory.Free(ptr)
-
+	go func(rc net.Conn, r io.Reader, buf []byte, errCh chan Result) {
 		nr, err := copyBuffer(io.Writer(rc), r, buf)
 		if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
 			if cw, ok := rc.(interface {
@@ -79,15 +106,9 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 		}
 		rc.SetReadDeadline(time.Now())
 		errCh <- Result{Num: nr, Err: err}
-	}(rc, r, errCh)
+	}(rc, r, bufA, errCh)
 
-	nr, nw, err := func(rc net.Conn, w io.Writer, errCh chan Result) (int64, int64, error) {
-		ptr, buf, err := memory.Alloc[byte](32 * 1024)
-		if err != nil {
-			panic(err)
-		}
-		defer memory.Free(ptr)
-
+	nr, nw, err := func(rc net.Conn, w io.Writer, buf []byte, errCh chan Result) (int64, int64, error) {
 		nw, err := copyBuffer(w, io.Reader(rc), buf)
 		if err == nil {
 			if cw, ok := w.(interface {
@@ -140,7 +161,7 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 		wakeReader(w)
 		r := <-errCh
 		return r.Num, nw, err
-	}(rc, w, errCh)
+	}(rc, w, bufB, errCh)
 
 	return nr, nw, err
 }

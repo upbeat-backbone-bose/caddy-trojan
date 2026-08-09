@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -25,7 +26,7 @@ import (
 )
 
 func init() {
-	caddy.RegisterModule(Handler{})
+	caddy.RegisterModule(&Handler{})
 	httpcaddyfile.RegisterHandlerDirective("trojan", func(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 		m := &Handler{}
 		err := m.UnmarshalCaddyfile(h.Dispenser)
@@ -37,6 +38,18 @@ func init() {
 // header after a WebSocket upgrade; without it an unauthenticated peer could
 // hold the handler goroutine forever.
 const headerTimeout = 10 * time.Second
+
+// connectFailLimit bounds how many failed Validate attempts are allowed
+// from a single remote address within connectFailWindow before the handler
+// stops running Validate (and its constant-time delay + storage I/O) for
+// that address for connectFailCooldown. The defaults form a "5 strikes in
+// 10s ⇒ lock out for 60s" policy that absorbs an unauthenticated flood
+// without locking out legitimate clients that mistype a password once.
+const (
+	connectFailLimit    = 5
+	connectFailWindow   = 10 * time.Second
+	connectFailCooldown = 60 * time.Second
+)
 
 // Handler implements an HTTP handler that ...
 type Handler struct {
@@ -51,14 +64,30 @@ type Handler struct {
 	logger   *zap.Logger
 	upgrader websocket.Upgrader
 
-	// headerTimeout overrides the default header read deadline when non-zero.
-	// It is unexported because production configuration uses the constant;
-	// tests in this package inject a smaller value to avoid 10-second runs.
+	// headerTimeout, failThreshold, failWindow and failCooldown override the
+	// default constants above when set to a non-zero value. They are
+	// unexported because production configuration uses the constants; tests
+	// in this package inject smaller values to keep runs short.
 	headerTimeout time.Duration
+	failThreshold int
+	failWindow    time.Duration
+	failCooldown  time.Duration
+
+	// failMu and failState implement the per-source rate limiter for the
+	// HTTP/2/3 CONNECT fast-fail path. nil until the first failure is
+	// observed.
+	failMu    sync.Mutex
+	failState map[string]*failRecord
+}
+
+type failRecord struct {
+	count        int
+	firstFailure time.Time
+	blockedUntil time.Time
 }
 
 // CaddyModule returns the Caddy module information.
-func (Handler) CaddyModule() caddy.ModuleInfo {
+func (*Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.trojan",
 		New: func() caddy.Module { return new(Handler) },
@@ -99,11 +128,21 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		if r.ProtoMajor == 1 {
 			return next.ServeHTTP(w, r)
 		}
+		// Fast-fail repeat offenders without running Validate (and its
+		// 250ms constant-time delay plus storage I/O). The rate-limiter is a
+		// sliding window; a fresh request that arrives while the source is
+		// blocked is short-circuited to next.ServeHTTP so the rest of the
+		// caddy chain — and the bad-actor's TCP loop — keep working.
+		if m.isRateLimited(r.RemoteAddr) {
+			return next.ServeHTTP(w, r)
+		}
 		auth := strings.TrimPrefix(r.Header.Get("Proxy-Authorization"), "Basic ")
 		if len(auth) != trojan.HeaderLen {
+			m.recordFailure(r.RemoteAddr)
 			return next.ServeHTTP(w, r)
 		}
 		if ok := m.upstream.Validate(auth); !ok {
+			m.recordFailure(r.RemoteAddr)
 			return next.ServeHTTP(w, r)
 		}
 		if m.Verbose {
@@ -260,4 +299,91 @@ func (c *FlushWriter) Write(b []byte) (int, error) {
 	n, err := c.Writer.Write(b)
 	c.Flusher.Flush()
 	return n, err
+}
+
+// failCfg returns the configured threshold/window/cooldown, falling back to
+// the production defaults when the corresponding struct field is zero. It
+// is the test-injection seam: tests override the struct fields with tiny
+// values to keep the suite fast; production leaves them zero and gets the
+// constants.
+func (m *Handler) failCfg() (threshold int, window, cooldown time.Duration) {
+	threshold = m.failThreshold
+	if threshold <= 0 {
+		threshold = connectFailLimit
+	}
+	window = m.failWindow
+	if window == 0 {
+		window = connectFailWindow
+	}
+	cooldown = m.failCooldown
+	if cooldown == 0 {
+		cooldown = connectFailCooldown
+	}
+	return
+}
+
+// recordFailure increments the failure counter for addr and, once the
+// threshold is reached within the window, marks the address as blocked
+// until the cooldown elapses. It is called on any HTTP/2/3 CONNECT path
+// that does not yield a validated user — wrong-length auth header, bad
+// password, or upstream lookup failure.
+//
+// Garbage collection: entries with no recent failures are pruned lazily
+// on the next access from the same address; bounded by the connect window
+// (10s by default) the worst-case memory is O(uniques-addr-in-window).
+func (m *Handler) recordFailure(addr string) {
+	if addr == "" {
+		return
+	}
+	threshold, window, cooldown := m.failCfg()
+	if threshold <= 0 {
+		return
+	}
+	m.failMu.Lock()
+	defer m.failMu.Unlock()
+	if m.failState == nil {
+		m.failState = make(map[string]*failRecord)
+	}
+	now := time.Now()
+	rec, ok := m.failState[addr]
+	if !ok {
+		rec = &failRecord{}
+		m.failState[addr] = rec
+	}
+	// Reset the counter if the previous failure fell outside the window.
+	if rec.firstFailure.IsZero() || now.Sub(rec.firstFailure) > window {
+		rec.count = 0
+		rec.firstFailure = now
+		rec.blockedUntil = time.Time{}
+	}
+	rec.count++
+	if rec.count >= threshold && rec.blockedUntil.IsZero() {
+		rec.blockedUntil = now.Add(cooldown)
+	}
+}
+
+// isRateLimited reports whether addr is currently in the blocked-window. A
+// blocked entry is cleared lazily on access once the cooldown elapses, so
+// legitimate retries are not punished past their sentence.
+func (m *Handler) isRateLimited(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	m.failMu.Lock()
+	defer m.failMu.Unlock()
+	rec, ok := m.failState[addr]
+	if !ok {
+		return false
+	}
+	if rec.blockedUntil.IsZero() {
+		return false
+	}
+	if time.Now().Before(rec.blockedUntil) {
+		return true
+	}
+	// Cooldown elapsed: clear so legitimate retries are not punished.
+	rec.blockedUntil = time.Time{}
+	rec.count = 0
+	rec.firstFailure = time.Time{}
+	return false
 }

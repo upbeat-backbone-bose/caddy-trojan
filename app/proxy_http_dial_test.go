@@ -229,7 +229,7 @@ func TestHttpProxyDialClosesConnOnWriteError(t *testing.T) {
 
 	tp := h.proxy.(*trackingProxy)
 	if got := tp.closed.Load(); got != 1 {
-		t.Errorf("trackingProxy.closed = %d, want 1 (HttpProxy.Dial must Close conn on write-error path)", got)
+		t.Errorf("trackingProxy.closed = %d, want 1 (HttpProxy.Dial must Close conn on write-error path); Dial err = %v", got, err)
 	}
 }
 

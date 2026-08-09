@@ -18,6 +18,16 @@ import (
 // (0, 0, err) return rather than a goroutine panic.
 const tcpBufSize = 32 * 1024
 
+// wakeGrace bounds how long HandleTCP keeps the client-side read open after
+// the remote side has closed its write direction (TCP half-close) before
+// force-waking the peer. The remote's FIN is not a full close: the client may
+// still have data in flight (e.g. SSH final packets), and an immediate read
+// deadline would truncate it and destabilize long-lived tunnels. The grace
+// window lets normal shutdown traffic through (SSH final packets arrive in
+// well under a second) while still releasing a truly silent peer quickly, so
+// a half-open client cannot deadlock the connection for long.
+const wakeGrace = 2 * time.Second
+
 func copyBuffer(w io.Writer, r io.Reader, buf []byte) (n int64, err error) {
 	for {
 		nr, er := r.Read(buf)
@@ -116,7 +126,14 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 			}); ok {
 				cw.CloseWrite()
 			}
-			wakeReader(w)
+			// Half-close: rc finished writing, but the client side may still
+			// be sending (see wakeGrace above). Give it a grace window to
+			// drain instead of force-waking immediately, which would truncate
+			// in-flight data and cause spurious disconnects on long-lived
+			// tunnels (e.g. SSH over trojan).
+			if c, ok := w.(net.Conn); ok {
+				_ = c.SetReadDeadline(time.Now().Add(wakeGrace))
+			}
 			r := <-errCh
 			return r.Num, nw, r.Err
 		}
@@ -152,7 +169,7 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 			r := <-errCh
 			return r.Num, nw, r.Err
 		}
-		rc.SetWriteDeadline(time.Now())
+		rc.SetWriteDeadline(time.Now().Add(wakeGrace))
 		if cw, ok := rc.(interface {
 			CloseWrite() error
 		}); ok {

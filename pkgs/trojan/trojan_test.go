@@ -314,3 +314,86 @@ func TestHandleTCPNormalPathUnaffected(t *testing.T) {
 	}
 }
 
+// TestHandleTCPHalfCloseDrainsClientData is a regression test for the
+// half-close handling in HandleTCP: when the remote side closes its write
+// direction (TCP half-close, e.g. an SSH server sending FIN), data the
+// client still has in flight must be delivered, not truncated. The fix
+// replaced an immediate wakeReader deadline on this path with a grace
+// window (wakeGrace); pre-fix, the immediate read deadline killed the
+// client→remote direction and dropped the final packets, causing spurious
+// disconnects on long-lived tunnels.
+func TestHandleTCPHalfCloseDrainsClientData(t *testing.T) {
+	// Tunnel client-side pair: tcTest (test holds) <-> tcTunnel (passed to
+	// HandleTCP as r and w).
+	lnT, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lnT.Close()
+	tcTunnel, err := net.Dial("tcp", lnT.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcTunnel.Close()
+	tcTest, err := lnT.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcTest.Close()
+
+	// Remote (rc) pair, standing in for the SSH server: rcTunnel is what
+	// HandleTCP dials, rcTest is the "server" the test controls.
+	lnR, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lnR.Close()
+	rcTunnel, err := net.Dial("tcp", lnR.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rcTunnel.Close()
+	rcTest, err := lnR.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rcTest.Close()
+
+	d := &dialReturningPipe{conn: rcTunnel}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = HandleTCP(tcTunnel, tcTunnel, failingAddr{}, d)
+	}()
+
+	// SSH server half-closes its write direction.
+	if err := rcTest.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("rc CloseWrite: %v", err)
+	}
+
+	// Give HandleTCP a moment to observe the remote EOF and enter the
+	// grace-window path.
+	time.Sleep(100 * time.Millisecond)
+
+	// The client still has a final packet in flight; it must arrive.
+	if _, err := tcTest.Write([]byte("final-packet")); err != nil {
+		t.Fatalf("client Write after half-close: %v", err)
+	}
+
+	got := make([]byte, len("final-packet"))
+	if _, err := io.ReadFull(rcTest, got); err != nil {
+		t.Fatalf("rc did not receive post-FIN data (truncated by immediate wake): %v", err)
+	}
+	if string(got) != "final-packet" {
+		t.Errorf("rc received %q, want %q", got, "final-packet")
+	}
+
+	// Unwind: close both sides so HandleTCP returns.
+	tcTest.Close()
+	rcTest.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("HandleTCP did not return after both sides closed")
+	}
+}

@@ -207,6 +207,16 @@ func TestHttpProxyDialClosesConnOnWriteError(t *testing.T) {
 	// Use SetLinger=0 so Close sends RST, guaranteeing WriteProxy fails
 	// rather than succeeding (kernel buffer would absorb FIN without RST).
 	fp := newFakeProxy(t, func(c net.Conn) {
+		// Wait for the client to start sending the CONNECT request before
+		// RSTing. On Linux an immediate linger-0 close can reset the
+		// connection during connect() itself (net.Dial returns ECONNRESET),
+		// so the post-dial error path would never be exercised. Reading one
+		// byte guarantees the client's connect completed and WriteProxy
+		// began; the subsequent RST then fails either a remaining write
+		// (EPIPE → write-error path) or the response read (ECONNRESET →
+		// read-error path), both of which must close the conn.
+		buf := make([]byte, 1)
+		_, _ = c.Read(buf)
 		if tcp, ok := c.(*net.TCPConn); ok {
 			_ = tcp.SetLinger(0)
 		}

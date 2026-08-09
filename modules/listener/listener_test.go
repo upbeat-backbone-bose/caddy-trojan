@@ -210,6 +210,103 @@ func TestListenerRewindOnInvalidCRLF(t *testing.T) {
 	}
 }
 
+// TestListenerClearsSniffDeadlineBeforeTunnel is a regression test for the
+// SSH-over-trojan disconnect loop. The listener sets a 10s read deadline
+// at the start of the trojan-header sniff and clears it on goroutine exit.
+// Before the fix, that deadline was never cleared until the goroutine
+// returned — which meant it bled into the trojan tunnel (HandleWithDialer)
+// and killed long-lived idle SSH/SCP connections during normal idle gaps
+// (SSH keepalive is typically 60s+).
+//
+// Method: drive the listener with a scripted fakeConn that returns the
+// full 58 valid bytes (56 key + CRLF), so the per-conn goroutine takes
+// the trojan-handling path and enters HandleWithDialer. We use a custom
+// Proxy whose Dial blocks until the test releases it, so we can observe
+// the fakeConn.deadline field — which records whatever SetReadDeadline
+// last set — *while* the tunnel is alive. After the listener finishes the
+// sniff and reaches HandleWithDialer, the deadline must be zero. Without
+// the fix the deadline would still be ~10s in the future.
+func TestListenerClearsSniffDeadlineBeforeTunnel(t *testing.T) {
+	t.Parallel()
+
+	fl := newFakeListener()
+
+	// Custom proxy that signals on Dial entry and then blocks until the
+	// test closes its release channel. Dial then returns an error so
+	// HandleTCP returns promptly and the goroutine unwinds.
+	dialEntered := make(chan struct{})
+	releaseDial := make(chan struct{})
+	ln := NewListener(fl, noopUpstream{}, &blockingDialProxy{
+		entered: dialEntered,
+		release: releaseDial,
+	}, zap.NewNop())
+	defer ln.Close()
+
+	// 58-byte trojan header (56 key + 0x0d 0x0a) followed by a valid
+	// HandleWithDialer request: command=Connect, ATYP=IPv4, 127.0.0.1:22,
+	// CRLF. HandleWithDialer needs at least 10 more bytes after the
+	// trojan header to dispatch into HandleTCP (which calls Dial).
+	scripts := make([]fakeRead, trojan.HeaderLen+2+10)
+	for i := 0; i < trojan.HeaderLen; i++ {
+		scripts[i] = fakeRead{data: []byte{'x'}, err: nil}
+	}
+	scripts[trojan.HeaderLen] = fakeRead{data: []byte{0x0d}, err: nil}
+	scripts[trojan.HeaderLen+1] = fakeRead{data: []byte{0x0a}, err: nil}
+	// HandleWithDialer bytes: CMD=1, ATYP=1, 127.0.0.1, port 22, CRLF.
+	post := []byte{0x01, 0x01, 127, 0, 0, 1, 0x00, 0x16, 0x0d, 0x0a}
+	for i, b := range post {
+		scripts[trojan.HeaderLen+2+i] = fakeRead{data: []byte{b}, err: nil}
+	}
+
+	conn := &fakeConn{scripts: scripts}
+	fl.acceptCh <- conn
+
+	go ln.loop()
+
+	// Wait until HandleWithDialer has reached Dial.
+	select {
+	case <-dialEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("listener did not reach HandleWithDialer.Dial within 2s")
+	}
+
+	// The fix: the listener must have cleared the sniff deadline BEFORE
+	// entering HandleWithDialer. The fakeConn.deadline field is set by
+	// every SetReadDeadline call (initial sniff timeout = ~10s; clear =
+	// zero). Without the clear, this would be ~10s in the future.
+	deadline := conn.deadline
+	if !deadline.IsZero() {
+		t.Errorf("conn read deadline at HandleWithDialer entry = %v (in %v); want zero time.Time{} (sniff deadline leaked into tunnel)", deadline, time.Until(deadline))
+	}
+
+	// Let Dial return an error so HandleWithDialer exits and the goroutine
+	// unwinds.
+	close(releaseDial)
+}
+
+// blockingDialProxy is a test-only Proxy that signals on Dial entry and
+// blocks until the test closes its release channel. The listener takes
+// the concrete *blockingDialProxy directly via NewListener, so no caddy
+// module registration is needed.
+type blockingDialProxy struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (*blockingDialProxy) Close() error { return nil }
+func (p *blockingDialProxy) Dial(_, _ string) (net.Conn, error) {
+	select {
+	case <-p.entered:
+	default:
+		close(p.entered)
+	}
+	<-p.release
+	return nil, errors.New("blockingDialProxy: exit")
+}
+func (*blockingDialProxy) ListenPacket(_, _ string) (net.PacketConn, error) {
+	return nil, errors.New("not supported")
+}
+
 // TestListenerAcceptErrorBackoff verifies that when the underlying Accept
 // fails repeatedly, the loop does not spin: it pauses ~100ms between
 // failures. Without the backoff, a failing underlying listener (e.g. during

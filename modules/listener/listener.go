@@ -173,12 +173,22 @@ func (l *Listener) loop() {
 
 		go func(c net.Conn, lg *zap.Logger, up app.Upstream) {
 			b := make([]byte, trojan.HeaderLen+2)
-			// Bound the sniff read; the deadline is cleared on every exit path
-			// so caddy/http handles the connection with its own timeouts.
+			// Bound the sniff read so a stalled peer cannot hold this
+			// goroutine forever. The deadline MUST be cleared before any
+			// path that hands the conn off to caddy (rewind) or to
+			// HandleWithDialer (tunnel); otherwise the sniff timeout would
+			// kill long-lived idle SSH/SCP tunnels ~sniffTimeout after the
+			// last byte arrived, with no warning. The defer below is the
+			// safety net for the read-error paths, where the conn is being
+			// closed anyway.
 			_ = c.SetReadDeadline(time.Now().Add(sniffTimeout))
 			defer func() {
 				_ = c.SetReadDeadline(time.Time{})
 			}()
+			// clearDeadline cancels the sniff timeout on the current path.
+			// Call it before any handoff (rewind to caddy, or to
+			// HandleWithDialer) so the deadline never bleeds past the sniff.
+			clearDeadline := func() { _ = c.SetReadDeadline(time.Time{}) }
 
 			for n := 0; n < trojan.HeaderLen+2; n += 1 {
 				nr, err := c.Read(b[n : n+1])
@@ -187,6 +197,7 @@ func (l *Listener) loop() {
 						lg.Error(fmt.Sprintf("read prefix error: read tcp %v -> %v: read: %v", c.RemoteAddr(), c.LocalAddr(), err))
 					} else {
 						lg.Error(fmt.Sprintf("read prefix error, not io, rewind and let normal caddy deal with it: %v", err))
+						clearDeadline()
 						select {
 						case <-l.closed:
 							c.Close()
@@ -205,6 +216,7 @@ func (l *Listener) loop() {
 				}
 				// mimic nginx
 				if b[n] == 0x0a && n < trojan.HeaderLen+1 {
+					clearDeadline()
 					select {
 					case <-l.closed:
 						c.Close()
@@ -213,6 +225,15 @@ func (l *Listener) loop() {
 					return
 				}
 			}
+
+			// Sniff is complete. Clear the deadline BEFORE Validate (so the
+			// 250ms validateDelay doesn't burn into the session deadline)
+			// and BEFORE HandleWithDialer (so the trojan tunnel inherits
+			// no read deadline at all and can stay idle as long as the
+			// client and upstream want). Without this clear, the 10s
+			// sniff deadline kills SSH/SCP tunnels during normal idle gaps
+			// (SSH keepalive is typically 60s+).
+			clearDeadline()
 
 			// check the net.Conn
 			if b[trojan.HeaderLen] != 0x0d || b[trojan.HeaderLen+1] != 0x0a ||

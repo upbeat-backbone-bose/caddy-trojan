@@ -133,9 +133,7 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 			// drain instead of force-waking immediately, which would truncate
 			// in-flight data and cause spurious disconnects on long-lived
 			// tunnels (e.g. SSH over trojan).
-			if c, ok := w.(net.Conn); ok {
-				_ = c.SetReadDeadline(time.Now().Add(wakeGrace))
-			}
+			trySetReadDeadline(w, time.Now().Add(wakeGrace))
 			r := <-errCh
 			return r.Num, nw, r.Err
 		}

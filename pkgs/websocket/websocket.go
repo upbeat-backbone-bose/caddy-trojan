@@ -69,3 +69,13 @@ func (c *Conn) Close() error {
 	c.Conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(time.Second*5))
 	return c.Conn.Close()
 }
+
+// setReadDeadline satisfies pkgs/trojan.wakeableConn: forwards the
+// deadline to the underlying net.Conn that the gorilla WebSocket wraps.
+// Without this hook, HandleTCP's half-close grace window cannot release
+// a blocked read on the WS path (the pre-abstraction code only checked
+// for a direct net.Conn assertion, which *Conn does not satisfy because
+// it embeds *websocket.Conn rather than net.Conn).
+func (c *Conn) setReadDeadline(t time.Time) error {
+	return c.Conn.UnderlyingConn().SetReadDeadline(t)
+}

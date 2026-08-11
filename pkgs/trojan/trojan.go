@@ -27,19 +27,8 @@ var errInvalidCRLF = errors.New("invalid CRLF terminator")
 // the whole process.
 var allocByteErr error
 
-// wakeReader sets an immediate read deadline on w's underlying connection so
-// that a goroutine blocked reading from the same connection is released. It is
-// used right before waiting on errCh so that a silent peer cannot deadlock
-// HandleTCP/HandleUDP forever (each half-close would otherwise leave the other
-// direction blocked and the deferred Close never runs). It applies to the
-// raw TCP / WebSocket / UDP tunnel paths, where the reader and writer share
-// the same net.Conn; the HTTP/2 and HTTP/3 CONNECT paths pass an http.Body /
-// http.Flusher instead and are governed by the HTTP server's own timeouts.
-func wakeReader(w io.Writer) {
-	if c, ok := w.(net.Conn); ok {
-		_ = c.SetReadDeadline(time.Now())
-	}
-}
+// wakeReader is defined in wakeable.go so the wakeableConn abstraction
+// sits next to the half-close grace window logic that uses it.
 
 const (
 	CmdConnect   = 1

@@ -11,7 +11,14 @@ func ByteSliceToString(b []byte) string {
 }
 
 func StringToByteSlice(s string) []byte {
-	return unsafe.Slice((*byte)(unsafe.Pointer(*(*uintptr)(unsafe.Pointer(&s)))), len(s))
+	// unsafe.StringData returns a *byte pointing at s's underlying bytes
+	// without going through a uintptr round-trip. The old form
+	//   unsafe.Slice((*byte)(unsafe.Pointer(*(*uintptr)(unsafe.Pointer(&s)))), len(s))
+	// violated the unsafe.Pointer rules (pointer<->uintptr conversions must
+	// stay within a single expression) and made Go 1.26's stricter vet
+	// flag the line as 'possible misuse of unsafe.Pointer'. unsafe.StringData
+	// is the standard library's blessed escape hatch for exactly this case.
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 // RemoveNullKeys removes keys with null values from a JSON object represented as a map[string]any.

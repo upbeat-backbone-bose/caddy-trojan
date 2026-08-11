@@ -137,6 +137,17 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 	}(rc, r, bufA, errCh)
 
 	nr, nw, err := func(rc net.Conn, w io.Writer, buf []byte, errCh chan Result) (int64, int64, error) {
+		// Main goroutine writes rc (upstream) to w (client side). The
+		// errors.Is(err, os.ErrDeadlineExceeded) checks below only need to
+		// match the stdlib sentinel: rc is a raw *net.TCPConn and gorilla's
+		// hideTempErr wrapping only applies to the wrapper's read side,
+		// not the write side. The half-close grace window
+		// (trySetReadDeadline further down) only sets the wrapper's read
+		// deadline, so copyBuffer's write path through w never produces a
+		// deadline error at all. The reader goroutine already uses
+		// errors.As + net.Error.Timeout() (see reader goroutine above) to
+		// recognize gorilla-wrapped timeouts; that path is where the
+		// hideTempErr shape actually surfaces.
 		nw, err := copyBuffer(w, io.Reader(rc), buf)
 		if err == nil {
 			if cw, ok := w.(interface {

@@ -1,15 +1,17 @@
 package app
 
-import (
-	"context"
+ import (
+ 	"context"
 	"strings"
-	"testing"
-	"time"
+ 	"sync"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/caddyserver/certmagic"
+ 	"github.com/imgk/caddy-trojan/pkgs/trojan"
+ 	"github.com/imgk/caddy-trojan/pkgs/x"
+ )
 
-	"github.com/caddyserver/certmagic"
-	"github.com/imgk/caddy-trojan/pkgs/trojan"
-	"github.com/imgk/caddy-trojan/pkgs/x"
-)
 
 // TestMemoryUpstreamValidateConsumeDelete exercises the key lifecycle of
 // MemoryUpstream: Add → Validate hit/miss → Consume → Delete → Validate miss.
@@ -227,9 +229,8 @@ func TestCaddyUpstreamValidateAppliesDelay(t *testing.T) {
 // Load, Delete, Exists, List, Stat, plus Lock/Unlock from Locker.
 //
 // storeCount / loadCount / existsCount record how many times each operation
-// was hit, and lastKey tracks the most recent key seen. Tests that need to
-// assert "no I/O" on a given call inspect these counters before vs. after.
 type memStorage struct {
+	mu         sync.Mutex
 	data       map[string][]byte
 	storeCount int
 	loadCount  int
@@ -240,8 +241,9 @@ type memStorage struct {
 func newMemStorage() *memStorage {
 	return &memStorage{data: make(map[string][]byte)}
 }
-
 func (m *memStorage) Store(_ context.Context, key string, value []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.storeCount++
 	m.lastKey = key
 	m.data[key] = value
@@ -249,6 +251,8 @@ func (m *memStorage) Store(_ context.Context, key string, value []byte) error {
 }
 
 func (m *memStorage) Load(_ context.Context, key string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.loadCount++
 	m.lastKey = key
 	v, ok := m.data[key]
@@ -259,11 +263,15 @@ func (m *memStorage) Load(_ context.Context, key string) ([]byte, error) {
 }
 
 func (m *memStorage) Delete(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.data, key)
 	return nil
 }
 
 func (m *memStorage) Exists(_ context.Context, key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.existsCount++
 	m.lastKey = key
 	_, ok := m.data[key]
@@ -271,6 +279,8 @@ func (m *memStorage) Exists(_ context.Context, key string) bool {
 }
 
 func (m *memStorage) List(_ context.Context, prefix string, _ bool) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var keys []string
 	for k := range m.data {
 		if strings.HasPrefix(k, prefix) {
@@ -281,6 +291,8 @@ func (m *memStorage) List(_ context.Context, prefix string, _ bool) ([]string, e
 }
 
 func (m *memStorage) Stat(_ context.Context, key string) (certmagic.KeyInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	v, ok := m.data[key]
 	if !ok {
 		return certmagic.KeyInfo{}, nil

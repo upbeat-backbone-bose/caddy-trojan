@@ -59,20 +59,22 @@ func copyBuffer(w io.Writer, r io.Reader, buf []byte) (n int64, err error) {
 	return n, err
 }
 
-// allocShortCircuit returns the (0, 0, err) result HandleTCP/HandleUDP should
-// return when the test-only allocByteErr is set. Production leaves
-// allocByteErr nil, so this is a no-op; tests override it to exercise the
-// alloc-failure branch without exhausting memory.
-func allocShortCircuit() (int64, int64, error) {
+// allocShortCircuit returns the error HandleTCP/HandleUDP should propagate
+// when the test-only allocByteErr is set, or nil when production code should
+// proceed to allocate normally. Production leaves allocByteErr nil, so this
+// is a no-op; tests override it to exercise the alloc-failure branch without
+// exhausting memory. Returns error only (not (int64, int64, error)) so a
+// future maintainer cannot accidentally use the int64 sentinels.
+func allocShortCircuit() error {
 	if err := allocByteErr; err != nil {
-		return 0, 0, fmt.Errorf("memory alloc error: %w", err)
+		return fmt.Errorf("memory alloc error: %w", err)
 	}
-	return -1, -1, nil
+	return nil
 }
 
 func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64, error) {
-	if nr, nw, err := allocShortCircuit(); err != nil {
-		return nr, nw, err
+	if err := allocShortCircuit(); err != nil {
+		return 0, 0, err
 	}
 	rc, err := d.Dial("tcp", addr.String())
 	if err != nil {

@@ -1,10 +1,12 @@
 package trojan
 
 import (
+	"errors"
 	"io"
+	"net"
+	"os"
 	"time"
 )
-
 // wakeableConn is the minimal abstraction over an io.Writer that lets
 // HandleTCP/HandleUDP release a blocked reader goroutine from a deadline
 // change, regardless of how many layers of wrapping sit between the
@@ -77,4 +79,28 @@ func trySetImmediateReadDeadline(w io.Writer) bool {
 // writers on the HTTP/2/3 CONNECT path).
 func wakeReader(w io.Writer) {
 	_ = trySetImmediateReadDeadline(w)
+}
+
+// isTimeoutError reports whether err is a clean timeout that we should
+// treat as a non-error exit: it matches the stdlib sentinel directly
+// and also any wrapper that implements net.Error with Timeout()==true
+// (e.g. gorilla/websocket's hideTempErr-wrapped *netError). Both
+// shapes mean "we asked the underlying conn to give up; the peer
+// didn't fail, the conn just hit a deadline", so neither should
+// propagate as a tunnel-level error. Used by HandleUDP's reader
+// defer and main goroutine cleanup paths to coalesce the reader's
+// own exit (rc.SetReadDeadline(now)) and the writer's resulting
+// ReadFrom timeout back into a single nil.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var nerr net.Error
+	if errors.As(err, &nerr) && nerr.Timeout() {
+		return true
+	}
+	return false
 }

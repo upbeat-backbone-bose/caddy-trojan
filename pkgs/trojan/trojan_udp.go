@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"time"
 
 	"github.com/imgk/caddy-trojan/pkgs/socks"
@@ -53,7 +52,15 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 	errCh := make(chan Result)
 	go func(rc net.PacketConn, r io.Reader, errCh chan Result) (nr int64, err error) {
 		defer func() {
-			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrDeadlineExceeded) {
+			// The reader's r.Read / io.ReadFull can return either
+			// io.EOF (client closed cleanly) or a deadline error
+			// (the writer side triggered rc.SetReadDeadline(now)
+			// to release this goroutine, or a wrapper like
+			// gorilla/websocket returned a hideTempErr-wrapped
+			// *netError with Timeout()==true). All three are
+			// "clean exit" shapes that the main goroutine can
+			// coalesce into a nil return.
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || isTimeoutError(err) {
 				err = nil
 			}
 			errCh <- Result{Num: nr, Err: err}
@@ -155,13 +162,22 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 
 	wakeReader(w)
 	r := <-errCh
-	// Prefer the reader goroutine's error over the writer's: the reader is
-	// the one that validates the trojan CRLF terminator, so a CRLF rejection
-	// (errInvalidCRLF) must not be masked by a concurrent writer-side error
-	// (e.g. a UDP write failing for an unrelated reason). If the reader has
-	// no error, fall back to the writer's.
+	// Prefer the reader goroutine's error over the writer's: the
+	// reader is the one that validates the trojan CRLF terminator, so
+	// a CRLF rejection (errInvalidCRLF) must not be masked by a
+	// concurrent writer-side error (e.g. a UDP write failing for an
+	// unrelated reason). When the reader has no error, fall back to
+	// the writer's — but if the writer's error is a clean timeout
+	// (the reader defer's rc.SetReadDeadline(now) typically triggers
+	// exactly that via the main loop's blocked ReadFrom), suppress
+	// it and report nil. Without this, every normal UDP session
+	// close (client-first EOF, 10-min idle timeout, or WS-over-UDP
+	// tunnel teardown) would log a spurious 'i/o timeout' error.
 	if r.Err != nil {
 		return r.Num, nw, r.Err
+	}
+	if isTimeoutError(err) {
+		return r.Num, nw, nil
 	}
 	return r.Num, nw, err
 	}(rc, w, bWrite, errCh, timeout)

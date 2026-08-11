@@ -135,11 +135,50 @@ func TestHandleUDPNoDeadlockOnIdle(t *testing.T) {
 	// wake the blocked reader instead of waiting on errCh forever.
 	select {
 	case err := <-done:
+		// F2 follow-up: the writer loop's deadline timeout, surfaced
+		// as the writer goroutine's os.ErrDeadlineExceeded after the
+		// reader defer's rc.SetReadDeadline-now call, must be coalesced
+		// to nil by HandleUDP's main-goroutine cleanup branch. Otherwise
+		// every normal UDP session close logs a spurious 'i/o timeout'.
 		if err != nil {
-			t.Logf("HandleUDP returned error: %v", err)
+			t.Errorf("HandleUDP returned %v, want nil on idle timeout", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("HandleUDP deadlocked on idle client")
+	}
+}
+
+// TestHandleUDPCleanExitOnClientClose verifies that a client closing
+// the read side of the conn produces a nil error from HandleUDP: the
+// reader's io.EOF is coalesced in the reader defer, the writer loop
+// then sees a deadline timeout from its blocked ReadFrom, and the
+// main goroutine's cleanup branch folds that timeout back to nil.
+// Pre-F2-followup, the writer-side deadline would propagate up as
+// "i/o timeout" and every normal UDP teardown would log a spurious
+// error.
+func TestHandleUDPCleanExitOnClientClose(t *testing.T) {
+	client, _ := net.Pipe()
+	defer client.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := HandleUDP(client, client, 5*time.Second, mockDialer{})
+		done <- err
+	}()
+
+	// Give HandleUDP time to start; the writer loop sets a 5s read
+	// deadline on the UDP socket. Then close the client side and
+	// expect HandleUDP to exit within the deadline.
+	time.Sleep(100 * time.Millisecond)
+	client.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("HandleUDP returned %v, want nil on client close", err)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("HandleUDP did not return within 7s after client close")
 	}
 }
 

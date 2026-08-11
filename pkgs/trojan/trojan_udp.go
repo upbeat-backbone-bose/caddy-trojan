@@ -141,16 +141,19 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 				break
 			}
 		}
-		rc.SetWriteDeadline(time.Now())
+	rc.SetWriteDeadline(time.Now())
 
-		if errors.Is(err, io.EOF) || errors.Is(err, os.ErrDeadlineExceeded) {
-			wakeReader(w)
-			r := <-errCh
-			return r.Num, nw, r.Err
-		}
-		wakeReader(w)
-		r := <-errCh
-		return r.Num, nw, err
+	wakeReader(w)
+	r := <-errCh
+	// Prefer the reader goroutine's error over the writer's: the reader is
+	// the one that validates the trojan CRLF terminator, so a CRLF rejection
+	// (errInvalidCRLF) must not be masked by a concurrent writer-side error
+	// (e.g. a UDP write failing for an unrelated reason). If the reader has
+	// no error, fall back to the writer's.
+	if r.Err != nil {
+		return r.Num, nw, r.Err
+	}
+	return r.Num, nw, err
 	}(rc, w, bWrite, errCh, timeout)
 
 	return nr, nw, err

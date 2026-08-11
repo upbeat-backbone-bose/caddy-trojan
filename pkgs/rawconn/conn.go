@@ -46,6 +46,21 @@ func (c *conn) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// CloseWrite implements net.CloseWriter on the wrapped conn when the
+// underlying type supports half-close (e.g. *net.TCPConn) or exposes
+// a CloseWrite() method. The wrapped conn is reachable via Conn, so
+// the cast covers raw TCP, in-process pipes, and any future type that
+// opts in.
+//
+// Limitation: *tls.Conn is not a CloseWriter. crypto/tls has never
+// exposed half-close on its Conn type (the TLS record layer cannot
+// signal a TLS-level half-close over a single direction), so this
+// method returns "not supported" when the wrapper is asked to half-
+// close a TLS conn. Callers that need TLS half-close must work around
+// it (e.g. by shutting the read side of the underlying TCP conn
+// directly). HTTP/2 listeners — which are the only consumer of
+// rawconn on the listener path — never use TCP half-close, so this
+// limitation is a documentation note rather than a functional gap.
 func (c *conn) CloseWrite() error {
 	if cc, ok := c.Conn.(*net.TCPConn); ok {
 		return cc.CloseWrite()

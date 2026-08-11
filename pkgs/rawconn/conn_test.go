@@ -10,10 +10,10 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
-
 // TestRewindConnTLS verifies that plaintext already read from a *tls.Conn can
 // be replayed through RewindConn on the current Go release.
 func TestRewindConnTLS(t *testing.T) {
@@ -106,6 +106,83 @@ func TestRewindConnPlainState(t *testing.T) {
 	}
 	if got := stater.ConnectionState(); got.Version != 0 {
 		t.Errorf("plain conn ConnectionState = %+v, want empty state", got)
+	}
+}
+
+// TestConnCloseWriteTCP verifies that closing the write side of a
+// wrapped *net.TCPConn forwards to the underlying conn: the peer
+// sees a clean EOF rather than a reset or hang. Uses a loopback
+// TCP listener/accept pair so CloseWrite is meaningful (net.Pipe
+// does not support half-close).
+func TestConnCloseWriteTCP(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	acceptDone := make(chan acceptResult, 1)
+	go func() {
+		c, err := ln.Accept()
+		acceptDone <- acceptResult{c, err}
+	}()
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var server net.Conn
+	select {
+	case r := <-acceptDone:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		server = r.conn
+	case <-time.After(2 * time.Second):
+		t.Fatal("Accept did not return")
+	}
+	defer server.Close()
+
+	wrapped := NewConn(server, nil)
+	if err := wrapped.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite on TCPConn wrapper = %v, want nil", err)
+	}
+
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1)
+	n, err := client.Read(buf)
+	if err != io.EOF {
+		t.Errorf("client Read after server CloseWrite = (%d, %v), want io.EOF", n, err)
+	}
+}
+
+// TestConnCloseWriteUnsupportedType verifies that closing the
+// write side of a wrapped conn that has no half-close support
+// returns 'not supported' rather than silently doing the wrong
+// thing. We use a net.Pipe (which has no CloseWrite method) as
+// the wrapped conn to drive the unsupported branch.
+func TestConnCloseWriteUnsupportedType(t *testing.T) {
+	t.Parallel()
+
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	wrapped := NewConn(c1, nil)
+	err := wrapped.(interface{ CloseWrite() error }).CloseWrite()
+	if err == nil {
+		t.Fatal("CloseWrite on unsupported wrapper = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "not supported") {
+		t.Errorf("CloseWrite error = %v, want 'not supported'", err)
 	}
 }
 

@@ -45,8 +45,7 @@ type wakeableConn interface {
 // wakeableConn, and returns whether the call was made. Callers use the
 // return value to decide whether the half-close grace window is honored
 // for this writer: false means the writer is opaque (e.g. an
-// http.ResponseWriter over HTTP/1 CONNECT) and the caller cannot bound
-// a silent peer's blocking read.
+// *handler.FlushWriter over HTTP/1/2/3 CONNECT) and the caller cannot bound
 func trySetReadDeadline(w io.Writer, t time.Time) bool {
 	if c, ok := w.(wakeableConn); ok {
 		_ = c.SetReadDeadline(t)
@@ -91,7 +90,7 @@ func trySetImmediateReadDeadline(rw any) bool {
 // finished, and the defer'd Close in the caller would never run. For
 // writers that do not implement wakeableConn, the call is a silent
 // no-op (matching the pre-abstraction behavior for non-net.Conn
-// writers on the HTTP/2/3 CONNECT path).
+// writers on the HTTP/1/2/3 CONNECT path).
 func wakeReader(w io.Writer) {
 	_ = trySetImmediateReadDeadline(w)
 }

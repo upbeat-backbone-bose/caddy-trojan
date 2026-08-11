@@ -204,6 +204,20 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 		}
 		wakeReader(w)
 		r := <-errCh
+		// Symmetric with the HandleUDP main goroutine's
+		// isTimeoutError branch: if the writer failed with a
+		// timeout but the reader exited cleanly, suppress the
+		// writer's error and report nil. The writer's deadline
+		// here is the upstream's write deadline we set on rc
+		// above, not the wrapper's, so a timeout means "the
+		// upstream stopped accepting" rather than "the wrapper's
+		// write failed"; pairing it with a clean reader exit
+		// means the tunnel is in a normal shutdown shape and the
+		// timeout is just the symmetric counterpart of the
+		// reader's release.
+		if r.Err == nil && isTimeoutError(err) {
+			return r.Num, nw, nil
+		}
 		return r.Num, nw, err
 	}(rc, w, bufB, errCh)
 

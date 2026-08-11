@@ -6,7 +6,7 @@ require (
 	github.com/caddyserver/caddy/v2 v2.11.4
 	github.com/caddyserver/certmagic v0.25.4
 	github.com/gorilla/websocket v1.5.3
-	github.com/imgk/memory-go v0.2.0
+	github.com/imgk/memory-go v0.3.0
 	github.com/shadowsocks/go-shadowsocks2 v0.1.6-0.20241020092332-e1fe9ea73740
 	go.uber.org/zap v1.28.0
 	golang.org/x/net v0.57.0

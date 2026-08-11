@@ -202,8 +202,8 @@ github.com/hexops/gotextdiff v1.0.3 h1:gitA9+qJrrTCsiCl7+kh75nPqQt1cx4ZkudSTLoUq
 github.com/hexops/gotextdiff v1.0.3/go.mod h1:pSWU5MAI3yDq+fZBTazCSJysOMbxWL1BSow5/V2vxeg=
 github.com/huandu/xstrings v1.5.0 h1:2ag3IFq9ZDANvthTwTiqSSZLjDc+BedvHPAp5tJy2TI=
 github.com/huandu/xstrings v1.5.0/go.mod h1:y5/lhBue+AyNmUVz9RLU9xbLR0o4KIIExikq4ovT0aE=
-github.com/imgk/memory-go v0.2.0 h1:yo6xo3tLJ7T+DqnXb1aIpHX21xFlPAXxtq94N/y9VEo=
-github.com/imgk/memory-go v0.2.0/go.mod h1:u30N9gS8frTN8wailsQUzIdIpuUFNAw6dFxiXfgYlqs=
+github.com/imgk/memory-go v0.3.0 h1:+N359YQuHbN6PiQ1N7NEZ4Ns8ywLqbe0hZ6yvHs8MtI=
+github.com/imgk/memory-go v0.3.0/go.mod h1:u30N9gS8frTN8wailsQUzIdIpuUFNAw6dFxiXfgYlqs=
 github.com/inconshreveable/mousetrap v1.0.0/go.mod h1:PxqpIevigyE2G7u3NXJIT2ANytuPF1OarO4DADm73n8=
 github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=
 github.com/inconshreveable/mousetrap v1.1.0/go.mod h1:vpF70FUmC8bwa3OWnCshd2FqLfsEA9PFc4w1p2J65bw=

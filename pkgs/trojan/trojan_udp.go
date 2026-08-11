@@ -124,10 +124,9 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 				// PacketConn.ReadFrom can return any net.Addr; if a future
 				// proxy returns a non-UDP packet source (e.g. a TCP-backed
 				// test fake), surface the unsupported address type as a
-				// hard error rather than panic on the unchecked type
-				// assertion below. The next loop iteration's ReadFrom
-				// will time out per the existing deadline, so this is
-				// self-recovering for transient cases.
+				// hard error and abort the session. The pre-fix comma-ok-less
+				// assertion would panic on the same input; the new branch
+				// fails loud and clean instead.
 				err = fmt.Errorf("handle udp error: unsupported packet address type %T", addr)
 				break
 			}

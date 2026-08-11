@@ -119,6 +119,18 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 			buf[socks.MaxAddrLen] = byte(n >> 8)
 			buf[socks.MaxAddrLen+1] = byte(n)
 
+			udpAddr, ok := addr.(*net.UDPAddr)
+			if !ok {
+				// PacketConn.ReadFrom can return any net.Addr; if a future
+				// proxy returns a non-UDP packet source (e.g. a TCP-backed
+				// test fake), surface the unsupported address type as a
+				// hard error rather than panic on the unchecked type
+				// assertion below. The next loop iteration's ReadFrom
+				// will time out per the existing deadline, so this is
+				// self-recovering for transient cases.
+				err = fmt.Errorf("handle udp error: unsupported packet address type %T", addr)
+				break
+			}
 			l := func(bb []byte, addr *net.UDPAddr) int64 {
 				if ipv4 := addr.IP.To4(); ipv4 != nil {
 					const offset = socks.MaxAddrLen - (1 + net.IPv4len + 2)
@@ -133,8 +145,7 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 					bb[offset+1+net.IPv6len], bb[offset+1+net.IPv6len+1] = byte(addr.Port>>8), byte(addr.Port)
 					return 1 + net.IPv6len + 2
 				}
-			}(buf[:socks.MaxAddrLen], addr.(*net.UDPAddr))
-			nw += 4 + int64(n) + l
+			}(buf[:socks.MaxAddrLen], udpAddr)
 
 			if _, ew := w.Write(buf[socks.MaxAddrLen-l : socks.MaxAddrLen+4+n]); ew != nil {
 				err = ew

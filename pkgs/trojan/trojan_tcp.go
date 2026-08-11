@@ -101,7 +101,23 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 	errCh := make(chan Result)
 	go func(rc net.Conn, r io.Reader, buf []byte, errCh chan Result) {
 		nr, err := copyBuffer(io.Writer(rc), r, buf)
-		if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		// A clean exit covers both the EOF-from-peer case and the
+		// wakeGrace-induced timeout case. The original code used
+		// errors.Is(err, os.ErrDeadlineExceeded), but wrappers like
+		// gorilla/websocket run their read through hideTempErr and
+		// return a *netError with Timeout()==true instead of the
+		// stdlib sentinel, so errors.Is would not match. Fall back
+		// to the net.Error interface so any wrapper that
+		// implements Timeout() correctly is recognized as a clean
+		// shutdown on this side of the tunnel.
+		isClean := err == nil
+		if !isClean {
+			var nerr net.Error
+			if errors.As(err, &nerr) && nerr.Timeout() {
+				isClean = true
+			}
+		}
+		if isClean {
 			if cw, ok := rc.(interface {
 				CloseWrite() error
 			}); ok {

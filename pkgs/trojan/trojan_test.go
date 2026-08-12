@@ -177,8 +177,8 @@ func TestHandleUDPCleanExitOnClientClose(t *testing.T) {
 		if err != nil {
 			t.Errorf("HandleUDP returned %v, want nil on client close", err)
 		}
-	case <-time.After(7 * time.Second):
-		t.Fatal("HandleUDP did not return within 7s after client close")
+	case <-time.After(6 * time.Second):
+		t.Fatal("HandleUDP did not return within 6s after client close")
 	}
 }
 

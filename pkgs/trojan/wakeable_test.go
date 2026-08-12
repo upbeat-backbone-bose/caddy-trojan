@@ -14,29 +14,24 @@ import (
 )
 
 // TestWakeableConnDispatchesToWebSocketWrapper is the cross-package
-// integration test for the wakeableConn abstraction. It uses a real
-// gorilla WebSocket server and client, wraps the server-side conn in
-// pkgs/websocket.Conn, and runs HandleTCP with that wrapper as the
-// writer. When the simulated upstream half-closes, the client stays
-// silent: HandleTCP's wakeGrace must release the blocked reader on
-// the underlying TCP conn through the wrapper within ~2s. Without
-// the cross-package interface hook, the wrapper's SetReadDeadline
-// would never be called and HandleTCP would block on errCh until the
-// OS TCP keepalive (~hours by default) closed the socket.
-//
-// The test catches the F1 regression shape: an unexported wakeableConn
-// method (e.g. setReadDeadline) can only be implemented by types in
-// the trojan package itself, so the type assertion in
-// trySetReadDeadline would silently fail for *pkgswebsocket.Conn and
-// the grace window would not apply on the WS path. With an exported
-// method (SetReadDeadline), *pkgswebsocket.Conn satisfies the
-// interface via method-set promotion from its embedded *gorilla.Conn.
+// integration test for the wakeableConn abstraction on the HandleTCP
+// path. It uses a real loopback TCP pair (not net.Pipe, which has
+// no half-close support and no SetReadDeadline propagation) and
+// half-closes the dial side. HandleTCP's writer loop sees io.EOF
+// on rc.Read, takes the grace path, trySetReadDeadline sets a
+// 2-second read deadline on the wrapper, the wrapper forwards
+// the deadline to the underlying TCP conn, the reader goroutine's
+// blocked wrapper.Read returns within the wakeGrace 2s budget, the
+// defer folds the timeout to nil, the main goroutine's
+// isTimeoutError check coalesces both back to nil. Asserts both the
+// timing (within wakeGrace + 1s margin) AND the error value
+// (HandleWithDialer must return nil, not 'i/o timeout'). The
+// error capture is via the gotErr channel so a future regression
+// that folds the timeout incorrectly is caught by t.Errorf,
+// not silently by t.Logf.
 func TestWakeableConnDispatchesToWebSocketWrapper(t *testing.T) {
 	t.Parallel()
 
-	// Simulated upstream. The dial side (upstreamTarget) is what the
-	// test half-closes to drive the HandleTCP EOF path; the accept
-	// side (upstreamPeer) is what HandleTCP reads from as rc.
 	tln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -58,9 +53,7 @@ func TestWakeableConnDispatchesToWebSocketWrapper(t *testing.T) {
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 
-	// handleDone is closed when HandleWithDialer returns. The handler
-	// goroutine is the only writer; closing it signals completion.
-	handleDone := make(chan struct{})
+	gotErr := make(chan error, 1)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
@@ -72,13 +65,9 @@ func TestWakeableConnDispatchesToWebSocketWrapper(t *testing.T) {
 		wrapper := pkgwebsocket.NewConn(c)
 		defer wrapper.Close()
 
-		// Dialer hands the already-accepted upstreamPeer back to
-		// HandleTCP; HandleTCP dials once at startup, gets
-		// upstreamPeer, and then reads/writes through it as rc.
 		d := &pipeDialer{conn: upstreamPeer}
-
-		HandleWithDialer(wrapper, wrapper, d)
-		close(handleDone)
+		_, _, err = HandleWithDialer(wrapper, wrapper, d)
+		gotErr <- err
 	})
 
 	srv := httptest.NewServer(mux)
@@ -99,62 +88,47 @@ func TestWakeableConnDispatchesToWebSocketWrapper(t *testing.T) {
 	}
 	defer clientConn.Close()
 
-	// Send a valid trojan CONNECT header to 127.0.0.1:80.
 	header := []byte{0x01, 0x01, 127, 0, 0, 1, 0x1f, 0x90, 0x0d, 0x0a}
 	if err := clientConn.WriteMessage(websocket.BinaryMessage, header); err != nil {
 		t.Fatalf("write header: %v", err)
 	}
 
-	// Give HandleTCP time to start, then half-close the upstream. The
-	// critical detail: we CloseWrite the DIAL side (upstreamTarget),
-	// not the ACCEPT side (upstreamPeer). TCP half-close only signals
-	// EOF to the opposite side; closing our own write side leaves our
-	// own Read direction untouched. The dial side is what upstreamPeer
-	// is reading from, so the test must CloseWrite the dial side.
 	time.Sleep(200 * time.Millisecond)
 	if err := upstreamTarget.(*net.TCPConn).CloseWrite(); err != nil {
 		t.Fatalf("upstreamTarget CloseWrite: %v", err)
 	}
 
-	// wakeGrace is 2s; allow up to 5s for scheduling noise. With the
-	// exported SetReadDeadline and the gorilla hideTempErr-aware
-	// reader goroutine, HandleWithDialer must return within this
-	// budget.
+	start := time.Now()
 	select {
-	case <-handleDone:
-		// HandleWithDialer returned within the budget. The
-		// wakeableConn dispatch reached the WS wrapper and the
-		// reader goroutine correctly classified the gorilla-wrapped
-		// timeout as a clean exit.
+	case e := <-gotErr:
+		elapsed := time.Since(start)
+		if elapsed > 3*time.Second {
+			t.Errorf("HandleWithDialer returned in %v, "+
+				"expected < 3s (wakeGrace + scheduling margin). "+
+				"A slow return suggests the clean-shutdown chain is degraded.", elapsed)
+		}
+		if e != nil {
+			t.Errorf("HandleWithDialer returned %v, want nil for a clean WS teardown. "+
+				"A non-nil return means the reader-defer or main-goroutine cleanup did "+
+				"not fold the writer-side deadline to nil (F2-followup regression).", e)
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("HandleWithDialer did not return within 5s after upstream half-close with silent client. " +
-			"This indicates either (a) the wakeableConn method is unexported so the " +
-			"cross-package WebSocket hook cannot satisfy the interface, or (b) the reader " +
-			"goroutine does not recognize gorilla's hideTempErr-wrapped timeout as a clean exit.")
+		t.Fatal("HandleWithDialer did not return within 5s after upstream half-close. " +
+			"This indicates either (a) the wakeableConn method is unexported so " +
+			"the cross-package WebSocket hook cannot satisfy the interface, or " +
+			"(b) the reader goroutine does not recognize gorilla's hideTempErr-" +
+			"wrapped timeout as a clean exit.")
 	}
 }
 
-// TestWakeableConnClientToUpstreamFlow exercises the main goroutine's
-// 'rc -> wrapper' write path through a real gorilla WebSocket. The
-// upstream pushes some data and then half-closes; HandleTCP's main
-// goroutine reads from rc and writes to the WS wrapper. The test
-// asserts HandleWithDialer returns within (wakeGrace + margin) once
-// the reader goroutine has seen the upstream's EOF and the grace
-// path has had a chance to release any blocking reads on the wrapper
-// side. This is the inverse of
-// TestWakeableConnDispatchesToWebSocketWrapper: there, the
-// upstream half-closes and the client stays silent; here, the
-// upstream pushes data and the client can drain it normally. The
-// test catches a regression where the main goroutine's
-// errors.Is(err, os.ErrDeadlineExceeded) checks in the
-// 'rc.SetReadDeadline(time.Minute)' drain loop (line 161) might be
-// triggered by a wrapper that wraps the rc read path — they are
-// not, today, but the test pins the no-deadlock invariant on this
-// direction as well.
+// TestWakeableConnClientToUpstreamFlow is the inverse-direction
+// integration test: upstream pushes data and then half-closes;
+// HandleTCP's main goroutine reads from rc and writes to the WS
+// wrapper. Asserts both the timing (within wakeGrace + margin)
+// AND that HandleWithDialer returns nil.
 func TestWakeableConnClientToUpstreamFlow(t *testing.T) {
 	t.Parallel()
 
-	// Upstream side, same shape as the half-close test.
 	tln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -171,11 +145,6 @@ func TestWakeableConnClientToUpstreamFlow(t *testing.T) {
 	}
 	defer upstreamPeer.Close()
 
-	// Push a small payload upstream and then half-close. HandleTCP
-	// will read these bytes from rc and write them through the WS
-	// wrapper to the client; once the upstream half-closes, rc.Read
-	// returns io.EOF and the main goroutine's 'err == nil' branch
-	// takes the grace path.
 	if _, err := upstreamTarget.Write([]byte("hello, world\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +156,7 @@ func TestWakeableConnClientToUpstreamFlow(t *testing.T) {
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 
-	handleDone := make(chan struct{})
+	gotErr := make(chan error, 1)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
@@ -200,8 +169,8 @@ func TestWakeableConnClientToUpstreamFlow(t *testing.T) {
 		defer wrapper.Close()
 
 		d := &pipeDialer{conn: upstreamPeer}
-		HandleWithDialer(wrapper, wrapper, d)
-		close(handleDone)
+		_, _, err = HandleWithDialer(wrapper, wrapper, d)
+		gotErr <- err
 	})
 
 	srv := httptest.NewServer(mux)
@@ -225,13 +194,109 @@ func TestWakeableConnClientToUpstreamFlow(t *testing.T) {
 		t.Fatalf("write header: %v", err)
 	}
 
+	start := time.Now()
 	select {
-	case <-handleDone:
-		// HandleWithDialer returned. The main goroutine saw the
-		// upstream's EOF on rc, the grace path was honored, and
-		// the reader goroutine's release propagated cleanly.
+	case e := <-gotErr:
+		elapsed := time.Since(start)
+		if elapsed > 3*time.Second {
+			t.Errorf("HandleWithDialer returned in %v, "+
+				"expected < 3s (wakeGrace + scheduling margin).", elapsed)
+		}
+		if e != nil {
+			t.Errorf("HandleWithDialer returned %v, want nil for a clean WS teardown. "+
+				"A non-nil return means the cleanup did not fold the writer-side "+
+				"deadline to nil.", e)
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("HandleWithDialer did not return within 5s after upstream write+half-close. " +
-			"This indicates the 'rc -> wrapper' write direction may have a deadline handling gap.")
+		t.Fatal("HandleWithDialer did not return within 5s after upstream write+half-close.")
 	}
+}
+
+// TestHandleUDPOverWebSocketWrapperCleanExit exercises the
+// HandleUDP path with a real gorilla WebSocket wrapper for both
+// r and w. The client writes the CmdAssociate header and
+// immediately closes; the server-side wrapper's NextReader
+// returns io.EOF (the client stream EOFs), the reader goroutine's
+// defer folds the EOF to nil, the writer loop's blocked ReadFrom
+// then sees a deadline timeout via rc.SetReadDeadline(now), and
+// the main goroutine's isTimeoutError check coalesces both back
+// to nil. Asserts BOTH the timing (within WS close round-trip +
+// margin) AND that HandleWithDialer returns nil (F2-followup
+// invariant).
+func TestHandleUDPOverWebSocketWrapperCleanExit(t *testing.T) {
+	t.Parallel()
+
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	gotErr := make(chan error, 1)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		wrapper := pkgwebsocket.NewConn(c)
+		defer wrapper.Close()
+
+		_, _, e := HandleWithDialer(wrapper, wrapper, mockDialerUDP{})
+		gotErr <- e
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Scheme = "ws"
+	u.Path = "/tunnel"
+
+	clientConn, _, err := (*websocket.DefaultDialer).Dial(u.String(), nil)
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+
+	// CmdAssociate (0x03) header for the UDP ASSOCIATE command.
+	header := []byte{0x03, 0x01, 127, 0, 0, 1, 0x1f, 0x90, 0x0d, 0x0a}
+	if err := clientConn.WriteMessage(websocket.BinaryMessage, header); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	clientConn.Close()
+
+	start := time.Now()
+	select {
+	case e := <-gotErr:
+		elapsed := time.Since(start)
+		if elapsed > 1*time.Second {
+			t.Errorf("HandleWithDialer took %v, expected < 1s for a "+
+				"clean WS-over-UDP teardown. A slow return suggests "+
+				"the clean-shutdown chain is degraded.", elapsed)
+		}
+		if e != nil {
+			t.Errorf("HandleWithDialer returned %v, want nil for a "+
+				"clean WS-over-UDP teardown. A non-nil return means the "+
+				"reader-defer or main-goroutine cleanup did not fold "+
+				"the writer-side deadline to nil (F2-followup regression).", e)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("HandleWithDialer did not return within 5s for WS-over-UDP.")
+	}
+}
+
+// mockDialerUDP is a Dialer that returns a real UDP socket from
+// ListenPacket so HandleUDP's writer loop has a valid PacketConn
+// to wait on. Dial is unused.
+type mockDialerUDP struct{}
+
+func (mockDialerUDP) Dial(string, string) (net.Conn, error) {
+	return nil, nil
+}
+
+func (mockDialerUDP) ListenPacket(string, string) (net.PacketConn, error) {
+	return net.ListenPacket("udp", "127.0.0.1:0")
 }

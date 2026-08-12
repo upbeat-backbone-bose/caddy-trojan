@@ -6,6 +6,8 @@ import (
 	"net"
 	"os"
 	"time"
+
+	pkgwebsocket "github.com/imgk/caddy-trojan/pkgs/websocket"
 )
 // wakeableConn is the minimal abstraction over an io.Writer that lets
 // HandleTCP/HandleUDP release a blocked reader goroutine from a deadline
@@ -118,3 +120,23 @@ func isTimeoutError(err error) bool {
 	}
 	return false
 }
+
+// Compile-time guards that the three types the wake protocol
+// depends on still satisfy the wakeableConn interface.
+// *net.TCPConn and *net.UDPConn implement SetReadDeadline
+// via their embedded net.Conn; *pkgwebsocket.Conn embeds
+// *gorilla.Conn, which implements SetReadDeadline, and
+// method-set promotion gives the wrapper the same signature.
+// Without these guards, a future stdlib rename of
+// net.Conn.SetReadDeadline, a gorilla refactor that drops
+// SetReadDeadline, or an unexported rename like
+// setReadDeadline would silently break the wake protocol at
+// runtime: the type assertion in trySetReadDeadline would
+// return false, the helper would no-op, and the half-close
+// grace window would silently fail. The compile-time guard
+// turns that into a build failure at the dependency boundary.
+var (
+	_ wakeableConn = (*net.TCPConn)(nil)
+	_ wakeableConn = (*net.UDPConn)(nil)
+	_ wakeableConn = (*pkgwebsocket.Conn)(nil)
+)

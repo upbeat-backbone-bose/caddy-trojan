@@ -43,11 +43,13 @@ type wakeableConn interface {
 	SetReadDeadline(time.Time) error
 }
 
-// trySetReadDeadline invokes w's SetReadDeadline(t) if w implements
-// wakeableConn, and returns whether the call was made. Callers use the
-// return value to decide whether the half-close grace window is honored
-// for this writer: false means the writer is opaque (e.g. an
-// *handler.FlushWriter over HTTP/1/2/3 CONNECT) and the caller cannot bound
+// trySetReadDeadline invokes w's SetReadDeadline(t) if w
+// implements wakeableConn, and returns whether the call was
+// made. Callers use the return value to decide whether the
+// half-close grace window is honored for this writer: false
+// means the writer is opaque (e.g. an *handler.FlushWriter
+// over HTTP/1/2/3 CONNECT) and the caller cannot bound a
+// silent peer's blocking read.
 func trySetReadDeadline(w io.Writer, t time.Time) bool {
 	if c, ok := w.(wakeableConn); ok {
 		_ = c.SetReadDeadline(t)
@@ -56,26 +58,19 @@ func trySetReadDeadline(w io.Writer, t time.Time) bool {
 	return false
 }
 
-// trySetImmediateReadDeadline is the wakeReader path: it asks w to
-// release any goroutine currently blocked in a Read on the same
-// underlying connection, by setting the read deadline to "now". The
+// trySetImmediateReadDeadline releases any goroutine currently
+// blocked in a Read on the underlying connection that rw
+// eventually wraps. The argument is typed as any (not io.Writer)
+// because the call site that needs to release a reader-side
+// block passes an io.Reader (the writer-loop hard-error break
+// path in HandleUDP needs to release the reader goroutine
+// blocked in r.Read; passing io.Reader through an io.Writer-
+// typed helper would force an unsafe cast or a confusing
+// interface{} at the call site). The dispatch remains a
+// wakeableConn interface assertion at the helper boundary. The
 // deadline is set to time.Now() (not the zero time) because the
 // wake_reader_test fake (and any real wrapper that gates on
 // "non-zero deadline ⇒ release") keys off the non-zero branch.
-// trySetImmediateReadDeadline releases any goroutine
-// currently blocked in a Read on the underlying connection
-// that rw eventually wraps. The argument is typed as any
-// (not io.Writer) because the call site that needs to
-// release a reader-side block passes an io.Reader (the
-// writer-loop hard-error break path in HandleUDP needs to
-// release the reader goroutine blocked in r.Read; passing
-// io.Reader through an io.Writer-typed helper would force
-// an unsafe cast or a confusing interface{} at the call
-// site). The dispatch remains a wakeableConn interface
-// assertion at the helper boundary. The deadline is set to
-// time.Now() (not the zero time) because the wake_reader_test
-// fake (and any real wrapper that gates on "non-zero deadline
-// ⇒ release") keys off the non-zero branch.
 func trySetImmediateReadDeadline(rw any) bool {
 	c, ok := rw.(wakeableConn)
 	if !ok {

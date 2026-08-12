@@ -102,17 +102,12 @@ func TestHandlerWebSocketRejectsInvalidCRLF(t *testing.T) {
 }
 
 // TestHandlerWebSocketHeaderTimeoutFires is a regression test for the
-// headerTimeout fix in ServeHTTP: after a WebSocket upgrade, the handler
-// must bound how long it will wait for the trojan header. Without the
-// deadline, an unauthenticated peer could connect, upgrade, and then stall
-// forever, holding the handler goroutine and a file descriptor.
-//
-// The test stands up a real HTTP server backed by ServeHTTP, dials it with
-// gorilla's DefaultDialer (completing the upgrade), then does not write
-// anything. The handler is configured with headerTimeout=100ms (via the
-// unexported field, since the const is 10s for production) and must
-// return within ~1s of the upgrade; we detect completion via a `done`
-// channel closed by the wrapper handler.
+// headerTimeout fix: after a WebSocket upgrade, the handler must bound how
+// long it waits for the trojan header, so an unauthenticated peer cannot hold
+// the handler goroutine and a file descriptor forever. The test upgrades via
+// a real server, writes nothing, and requires the handler to return within
+// ~1s (headerTimeout=100ms injected via the unexported field), detected via
+// a `done` channel closed by the wrapper.
 func TestHandlerWebSocketHeaderTimeoutFires(t *testing.T) {
 	t.Parallel()
 
@@ -366,21 +361,12 @@ func TestHandlerRateLimitWindowResets(t *testing.T) {
 	}
 }
 
-// TestHandlerFailStateCleanupBoundsMemory is a regression test for the
-// failState memory leak: the map previously grew unbounded as unique
-// RemoteAddrs accumulated single-failure entries that were never deleted
-// (the only deletion path was isRateLimited's lazy clear, which only
-// fired when the same address came back within the cooldown window —
-// single-failure entries never triggered it).
-//
-// Method: drive the rate limiter with a unique address that fails once
-// and never returns. After the cooldown elapses, a background cleanup
-// goroutine (spawned by recordFailure) must remove the entry. We assert
-// failState is empty after the cooldown.
-//
-// The test uses tiny cooldown/window values to keep the suite fast, and
-// Cleanup() at the end so the background goroutine doesn't outlive the
-// test (which would otherwise leak into the test binary).
+// TestHandlerFailStateCleanupBoundsMemory is a regression test for a failState
+// leak: single-failure entries from unique RemoteAddrs were never deleted
+// (isRateLimited only prunes an address that returns within the cooldown). The
+// background cleanup goroutine must remove them once the cooldown elapses;
+// we assert failState is empty afterwards, using tiny cooldowns to keep the
+// suite fast and Cleanup() so the goroutine does not outlive the test.
 func TestHandlerFailStateCleanupBoundsMemory(t *testing.T) {
 	t.Parallel()
 
@@ -434,20 +420,12 @@ func TestHandlerFailStateCleanupBoundsMemory(t *testing.T) {
 	}
 }
 
-// TestHandlerWebSocketHeaderDeadlineDoesNotLeakIntoTunnel is the
-// handler-side counterpart of TestListenerClearsSniffDeadlineBeforeTunnel.
-// The WebSocket upgrade path also sets a 10s header-timeout deadline on
-// the underlying conn; without the fix, that deadline bled into the
-// trojan tunnel (HandleWithDialer) and killed long-lived idle SSH-over-WS
-// tunnels during normal idle gaps.
-//
-// Method: stand up an httptest.Server, upgrade to WebSocket, send a
-// valid trojan header + HandleWithDialer request, then wait longer than
-// headerTimeout and verify the WebSocket is still alive (i.e. the handler
-// has not exited due to a leaked deadline firing inside the tunnel).
-// We use a stub "server" conn that returns EOF immediately, which forces
-// HandleTCP's main goroutine into the err==nil branch (so the wakeGrace
-// deadline applies — without the fix, the header timeout fires first).
+// TestHandlerWebSocketHeaderDeadlineDoesNotLeakIntoTunnel is the handler-side
+// counterpart of the listener sniff-deadline regression: the 10s header
+// timeout must not bleed into the trojan tunnel. We upgrade to WebSocket,
+// send a valid header, wait past headerTimeout, and verify the tunnel is
+// still alive; a stub server conn that returns EOF forces the wakeGrace
+// deadline branch (where a leaked header timeout would fire first).
 func TestHandlerWebSocketHeaderDeadlineDoesNotLeakIntoTunnel(t *testing.T) {
 	t.Parallel()
 
@@ -552,20 +530,12 @@ var (
 	_ app.Proxy    = (*eofOnFirstReadProxy)(nil)
 )
 
-// TestHandlerFailStateCleanupLoopDoesNotPanicOnTinyCooldown is a
-// defense-in-depth regression for the division-by-zero edge case in
-// cleanupLoop: cooldown/2 with time.Duration is integer division, so a
-// failCooldown below 2ns rounds interval to 0, which makes
-// time.NewTicker panic with "non-positive interval for NewTicker" and
-// crashes the test binary. Production uses connectFailCooldown = 60s
-// (never triggers), but the unexported failCooldown field has no floor
-// and a future test or config could pick a sub-nanosecond value. The fix
-// in cleanupLoop coerces interval to a sensible default when the
-// division rounds to zero; this test pins the behavior.
-//
-// We invoke cleanupLoop directly (not through recordFailure /
-// spawnCleanupLoop) so we can recover from any panic and assert on it
-// without terminating the test process.
+// TestHandlerFailStateCleanupLoopDoesNotPanicOnTinyCooldown pins the
+// cleanupLoop guard against a zero tick interval: cooldown/2 with integer
+// division rounds to 0 for sub-nanosecond cooldowns, which would make
+// time.NewTicker panic. cleanupLoop coerces the interval to a sane default;
+// this test asserts no panic. cleanupLoop is invoked directly so a panic can
+// be recovered without terminating the test process.
 func TestHandlerFailStateCleanupLoopDoesNotPanicOnTinyCooldown(t *testing.T) {
 	t.Parallel()
 

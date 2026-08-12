@@ -34,24 +34,18 @@ type Upstream interface {
 	Consume(string, int64, int64) error
 }
 
-// validateDelay is applied uniformly on both success and failure paths of
-// Validate so that password validation is a slow, constant-time operation
-// from an observer's perspective: it raises the cost of online password
-// guessing and removes the success/failure timing signal.
+// validateDelay is applied uniformly on success and failure paths of Validate
+// so password validation is constant-time to an observer, raising the cost of
+// online password guessing.
 const validateDelay = 250 * time.Millisecond
 
-// errInvalidStorageKey is returned by Upstream methods when a key fails the
-// validStorageKey check. Storage keys that escape this check (wrong length,
-// non-hex bytes, "../" segments, absolute paths) are rejected before any
-// storage I/O so they cannot bypass authentication or overwrite JSON files
-// outside the configured prefix via filepath.Join on certmagic.FileStorage.
+// errInvalidStorageKey is returned when a key fails validStorageKey.
 var errInvalidStorageKey = errors.New("invalid storage key")
 
-// validStorageKey reports whether k is a safe hex SHA224 digest suitable for
-// use as a certmagic.Storage key. The legitimate code path always produces
-// 56 bytes of lowercase hex (see trojan.GenKey); anything else — wrong
-// length, non-hex bytes, "../" or absolute-path components — is rejected at
-// the Upstream boundary so it cannot reach the storage layer.
+// validStorageKey reports whether k is a safe hex key suitable as a
+// certmagic.Storage key. Legitimate keys are 56 bytes of lowercase hex (see
+// trojan.GenKey); anything else — wrong length, non-hex bytes, "../" or
+// absolute-path components — is rejected before it reaches the storage layer.
 func validStorageKey(k string) bool {
 	if len(k) != trojan.HeaderLen {
 		return false
@@ -152,8 +146,7 @@ func (u *MemoryUpstream) Cleanup() error {
 
 // sendTask forwards t to the persistence goroutine, recovering from a send on
 // a closed channel. Cleanup closes u.ch while in-flight connections may still
-// call Add/Delete/Consume; without this guard that shutdown race would panic
-// and crash the whole process.
+// call Add/Delete/Consume; without this guard the shutdown race would panic.
 func (u *MemoryUpstream) sendTask(t Task) (ok bool) {
 	defer func() {
 		if recover() != nil {
@@ -224,9 +217,9 @@ func (u *MemoryUpstream) Validate(k string) bool {
 }
 
 func (u *MemoryUpstream) Consume(k string, nr, nw int64) error {
-	// Deep-copy k: it may be a zero-copy string (see pkgs/x.ByteSliceToString)
-	// backed by a caller-owned buffer. It is used as a map key and forwarded to
-	// the persistence goroutine asynchronously, so it must own its memory.
+	// k may be a zero-copy string (see pkgs/x.ByteSliceToString) backed by a
+	// caller-owned buffer; clone it since it is used as a map key and
+	// forwarded to the persistence goroutine asynchronously.
 	k = strings.Clone(k)
 	u.mu.Lock()
 	traffic := u.mm[k]
@@ -318,10 +311,8 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
 
 func (u *CaddyUpstream) Validate(k string) bool {
 	if !validStorageKey(k) {
-		// Reject attack vectors (wrong length, non-hex, "../") without any
-		// storage I/O. The constant-time delay is intentionally NOT applied:
-		// these aren't password-guessing attempts — they're injection probes,
-		// and an attacker already knows whether their key is well-formed.
+		// Reject injection probes without storage I/O or the delay: an
+		// attacker already knows whether a malformed key is well-formed.
 		return false
 	}
 	time.Sleep(validateDelay)

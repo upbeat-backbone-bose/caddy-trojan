@@ -436,18 +436,19 @@ func TestHandleTCPHalfCloseDrainsClientData(t *testing.T) {
 		t.Fatal("HandleTCP did not return after both sides closed")
 	}
 }
+
 // assertion is reached.
 type addrPacketConn struct{}
 
 func (addrPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
 	return 0, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 80}, nil
 }
-func (addrPacketConn) WriteTo([]byte, net.Addr) (int, error)  { return 0, nil }
-func (addrPacketConn) Close() error                           { return nil }
-func (addrPacketConn) LocalAddr() net.Addr                    { return nil }
-func (addrPacketConn) SetDeadline(time.Time) error            { return nil }
-func (addrPacketConn) SetReadDeadline(time.Time) error        { return nil }
-func (addrPacketConn) SetWriteDeadline(time.Time) error       { return nil }
+func (addrPacketConn) WriteTo([]byte, net.Addr) (int, error) { return 0, nil }
+func (addrPacketConn) Close() error                          { return nil }
+func (addrPacketConn) LocalAddr() net.Addr                   { return nil }
+func (addrPacketConn) SetDeadline(time.Time) error           { return nil }
+func (addrPacketConn) SetReadDeadline(time.Time) error       { return nil }
+func (addrPacketConn) SetWriteDeadline(time.Time) error      { return nil }
 
 type nonUDPDialer struct{}
 
@@ -456,35 +457,15 @@ func (nonUDPDialer) ListenPacket(string, string) (net.PacketConn, error) {
 	return addrPacketConn{}, nil
 }
 
-// TestHandleUDPNonUDPAddrHardError is the regression test for the
-// 65b7a42 comma-ok hardening AND the reader-release fix: when
-// the writer loop's addr.(*net.UDPAddr) assertion fails,
-// HandleUDP must surface a 'unsupported packet address type'
-// error and the writer's hard-error break must release the
-// reader goroutine so the main goroutine does not hang waiting
-// for it.
+// TestHandleUDPNonUDPAddrHardError covers the comma-ok hardening plus the
+// reader-release fix: when the writer loop's addr.(*net.UDPAddr) assertion
+// fails, HandleUDP must surface an 'unsupported packet address type' error and
+// release the reader goroutine so the main goroutine does not hang on errCh.
 //
-// Test design: r is a net.Pipe; the test does NOT close the
-// client side of the pipe (that would let the reader see an
-// immediate io.EOF and bypass the release path entirely,
-// making the test pass even without the fix). Instead, the
-// reader goroutine blocks in serverSide.Read waiting for data
-// the test will never write. The writer loop's hard-error
-// break must call trySetImmediateReadDeadline on the captured
-// r so the reader's blocked Read returns a timeout error,
-// the reader defer folds it to nil, the main goroutine sees
-// r.Err == nil and the writer's hard error, and HandleUDP
-// returns the 'unsupported packet address type' error within
-// a millisecond. Pre-fix, the test hangs past the 5-second
-// budget because the reader stays blocked on serverSide.Read
-// and the main goroutine never sees r.Err != nil.
-//
-// The hard error itself is the 65b7a42 comma-ok branch; the
-// reader release is the e44c4a3 follow-up fix. Without both,
-// the test fails: pre-65b7a42 the writer would panic on the
-// unchecked assertion; pre-e44c4a3 the writer's hard error
-// would not release the reader and the main goroutine would
-// hang on the errCh wait.
+// The client side of the pipe is deliberately not closed, so the reader blocks
+// in serverSide.Read; only trySetImmediateReadDeadline on the hard-error break
+// releases it. Pre-fix the writer panicked (no comma-ok) or the main goroutine
+// hung (no reader release).
 func TestHandleUDPNonUDPAddrHardError(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
 	defer clientSide.Close()

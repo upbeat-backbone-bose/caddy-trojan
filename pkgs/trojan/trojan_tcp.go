@@ -11,21 +11,14 @@ import (
 	"github.com/imgk/memory-go"
 )
 
-// tcpBufSize is the per-direction copy buffer for HandleTCP. The pool variant
-// of memory.Alloc never returns errors; the malloc_syscall variant (used by
-// CI builds per AGENTS.md) does. Both buffers are allocated in the main
-// flow before goroutines spawn so an mmap failure surfaces as a regular
+// tcpBufSize is the per-direction copy buffer for HandleTCP. Allocated in the
+// main flow before goroutines spawn so an mmap failure surfaces as a regular
 // (0, 0, err) return rather than a goroutine panic.
 const tcpBufSize = 32 * 1024
 
-// wakeGrace bounds how long HandleTCP keeps the client-side read open after
-// the remote side has closed its write direction (TCP half-close) before
-// force-waking the peer. The remote's FIN is not a full close: the client may
-// still have data in flight (e.g. SSH final packets), and an immediate read
-// deadline would truncate it and destabilize long-lived tunnels. The grace
-// window lets normal shutdown traffic through (SSH final packets arrive in
-// well under a second) while still releasing a truly silent peer quickly, so
-// a half-open client cannot deadlock the connection for long.
+// wakeGrace bounds how long HandleTCP keeps the client-side read open after the
+// remote half-closes its write side. The FIN is not a full close: in-flight
+// data (e.g. SSH final packets) must drain before the peer is force-woken.
 const wakeGrace = 2 * time.Second
 
 func copyBuffer(w io.Writer, r io.Reader, buf []byte) (n int64, err error) {
@@ -59,12 +52,9 @@ func copyBuffer(w io.Writer, r io.Reader, buf []byte) (n int64, err error) {
 	return n, err
 }
 
-// allocShortCircuit returns the error HandleTCP/HandleUDP should propagate
-// when the test-only allocByteErr is set, or nil when production code should
-// proceed to allocate normally. Production leaves allocByteErr nil, so this
-// is a no-op; tests override it to exercise the alloc-failure branch without
-// exhausting memory. Returns error only (not (int64, int64, error)) so a
-// future maintainer cannot accidentally use the int64 sentinels.
+// allocShortCircuit returns the test-only allocByteErr, or nil in production
+// so HandleTCP/HandleUDP proceed to allocate normally. Tests override
+// allocByteErr to exercise the alloc-failure branch without exhausting memory.
 func allocShortCircuit() error {
 	if err := allocByteErr; err != nil {
 		return fmt.Errorf("memory alloc error: %w", err)
@@ -101,15 +91,9 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 	errCh := make(chan Result)
 	go func(rc net.Conn, r io.Reader, buf []byte, errCh chan Result) {
 		nr, err := copyBuffer(io.Writer(rc), r, buf)
-		// A clean exit covers both the EOF-from-peer case and the
-		// wakeGrace-induced timeout case. The original code used
-		// errors.Is(err, os.ErrDeadlineExceeded), but wrappers like
-		// gorilla/websocket run their read through hideTempErr and
-		// return a *netError with Timeout()==true instead of the
-		// stdlib sentinel, so errors.Is would not match. Fall back
-		// to the net.Error interface so any wrapper that
-		// implements Timeout() correctly is recognized as a clean
-		// shutdown on this side of the tunnel.
+		// Clean exits cover EOF and the wakeGrace timeout. Wrappers like
+		// gorilla/websocket return a *netError with Timeout()==true rather
+		// than the stdlib sentinel, so check the net.Error interface too.
 		isClean := err == nil
 		if !isClean {
 			var nerr net.Error
@@ -137,17 +121,10 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 	}(rc, r, bufA, errCh)
 
 	nr, nw, err := func(rc net.Conn, w io.Writer, buf []byte, errCh chan Result) (int64, int64, error) {
-		// Main goroutine writes rc (upstream) to w (client side). The
-		// errors.Is(err, os.ErrDeadlineExceeded) checks below only need to
-		// match the stdlib sentinel: rc is a raw *net.TCPConn and gorilla's
-		// hideTempErr wrapping only applies to the wrapper's read side,
-		// not the write side. The half-close grace window
-		// (trySetReadDeadline further down) only sets the wrapper's read
-		// deadline, so copyBuffer's write path through w never produces a
-		// deadline error at all. The reader goroutine already uses
-		// errors.As + net.Error.Timeout() (see reader goroutine above) to
-		// recognize gorilla-wrapped timeouts; that path is where the
-		// hideTempErr shape actually surfaces.
+		// The write path through w never sees a deadline error: rc is a raw
+		// *net.TCPConn and only the reader goroutine's deadline is set (via
+		// trySetReadDeadline). Timeout detection therefore stays on the
+		// stdlib sentinel here.
 		nw, err := copyBuffer(w, io.Reader(rc), buf)
 		if err == nil {
 			if cw, ok := w.(interface {
@@ -155,11 +132,8 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 			}); ok {
 				cw.CloseWrite()
 			}
-			// Half-close: rc finished writing, but the client side may still
-			// be sending (see wakeGrace above). Give it a grace window to
-			// drain instead of force-waking immediately, which would truncate
-			// in-flight data and cause spurious disconnects on long-lived
-			// tunnels (e.g. SSH over trojan).
+			// rc finished writing but the client may still be sending; give
+			// it wakeGrace to drain instead of truncating in-flight data.
 			trySetReadDeadline(w, time.Now().Add(wakeGrace))
 			r := <-errCh
 			return r.Num, nw, r.Err
@@ -204,17 +178,8 @@ func HandleTCP(r io.Reader, w io.Writer, addr net.Addr, d Dialer) (int64, int64,
 		}
 		wakeReader(w)
 		r := <-errCh
-		// Symmetric with the HandleUDP main goroutine's
-		// isTimeoutError branch: if the writer failed with a
-		// timeout but the reader exited cleanly, suppress the
-		// writer's error and report nil. The writer's deadline
-		// here is the upstream's write deadline we set on rc
-		// above, not the wrapper's, so a timeout means "the
-		// upstream stopped accepting" rather than "the wrapper's
-		// write failed"; pairing it with a clean reader exit
-		// means the tunnel is in a normal shutdown shape and the
-		// timeout is just the symmetric counterpart of the
-		// reader's release.
+		// If the writer timed out but the reader exited cleanly, the tunnel is
+		// in a normal shutdown shape: report nil.
 		if r.Err == nil && isTimeoutError(err) {
 			return r.Num, nw, nil
 		}

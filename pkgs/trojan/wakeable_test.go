@@ -14,21 +14,11 @@ import (
 )
 
 // TestWakeableConnDispatchesToWebSocketWrapper is the cross-package
-// integration test for the wakeableConn abstraction on the HandleTCP
-// path. It uses a real loopback TCP pair (not net.Pipe, which has
-// no half-close support and no SetReadDeadline propagation) and
-// half-closes the dial side. HandleTCP's writer loop sees io.EOF
-// on rc.Read, takes the grace path, trySetReadDeadline sets a
-// 2-second read deadline on the wrapper, the wrapper forwards
-// the deadline to the underlying TCP conn, the reader goroutine's
-// blocked wrapper.Read returns within the wakeGrace 2s budget, the
-// defer folds the timeout to nil, the main goroutine's
-// isTimeoutError check coalesces both back to nil. Asserts both the
-// timing (within wakeGrace + 1s margin) AND the error value
-// (HandleWithDialer must return nil, not 'i/o timeout'). The
-// error capture is via the gotErr channel so a future regression
-// that folds the timeout incorrectly is caught by t.Errorf,
-// not silently by t.Logf.
+// integration test for wakeableConn on the HandleTCP path. Using a real
+// loopback TCP pair (net.Pipe has no half-close), it half-closes the dial
+// side so the grace path sets a read deadline that must wake the reader
+// within wakeGrace. Asserts both the timing (wakeGrace + 1s margin) and that
+// HandleWithDialer returns nil (not 'i/o timeout').
 func TestWakeableConnDispatchesToWebSocketWrapper(t *testing.T) {
 	t.Parallel()
 

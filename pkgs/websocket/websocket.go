@@ -69,10 +69,8 @@ func (c *Conn) Close() error {
 	c.Conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(time.Second*5))
 	return c.Conn.Close()
 }
-// SetReadDeadline is promoted from the embedded *gorilla.Conn, so it
-// satisfies pkgs/trojan.wakeableConn automatically: HandleTCP's
-// half-close grace window and the wakeReader path will forward the
-// deadline through gorilla to the underlying net.Conn. We intentionally
-// do NOT add a wrapper method: gorilla's *websocket.Conn already
-// implements SetReadDeadline(t) by calling c.conn.SetReadDeadline(t),
-// and method-set promotion gives the wrapper the same signature.
+
+// SetReadDeadline is promoted from the embedded *gorilla.Conn, satisfying
+// pkgs/trojan.wakeableConn automatically. We intentionally add no wrapper
+// method: gorilla's *websocket.Conn already forwards SetReadDeadline to the
+// underlying net.Conn, and method-set promotion gives it the same signature.

@@ -190,17 +190,10 @@ func TestHttpProxyDialClosesConnOnNonOKStatus(t *testing.T) {
 }
 
 // TestHttpProxyDialClosesConnOnWriteError covers the "write request error"
-// branch in HttpProxy.Dial: when req.WriteProxy fails (because the upstream
-// sent FIN/RST mid-request), the dialer must explicitly close the conn
-// rather than leave the fd to the runtime finalizer.
-//
-// We use trackingProxy (via the pre_proxy chain) to count Close calls on
-// the underlying conn. Without the explicit Close in the WriteError branch,
-// the runtime might clean up eventually but trackingProxy.closed would be 0
-// during the test's observation window.
-//
-// The fake proxy reads the CONNECT request and then closes immediately,
-// causing the client's WriteProxy to fail with EPIPE / "broken pipe".
+// branch in HttpProxy.Dial: when req.WriteProxy fails, the dialer must
+// explicitly close the conn. A fake proxy that reads the CONNECT request then
+// closes immediately makes WriteProxy fail with a broken pipe; a
+// trackingProxy counts Close calls to assert the fix.
 func TestHttpProxyDialClosesConnOnWriteError(t *testing.T) {
 	t.Parallel()
 

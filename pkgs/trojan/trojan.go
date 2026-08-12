@@ -21,14 +21,8 @@ var errInvalidCRLF = errors.New("invalid CRLF terminator")
 
 // allocByteErr, when non-nil, is returned by HandleTCP/HandleUDP instead of
 // performing real memory.Alloc. Production leaves it nil; tests set it to
-// simulate an mmap failure under the `malloc_syscall` build tag without
-// actually exhausting memory. The B3 fix wires the check into HandleTCP
-// and HandleUDP; without the check, a panic inside a goroutine would crash
-// the whole process.
+// simulate an mmap failure without exhausting memory.
 var allocByteErr error
-
-// wakeReader is defined in wakeable.go so the wakeableConn abstraction
-// sits next to the half-close grace window logic that uses it.
 
 const (
 	CmdConnect   = 1

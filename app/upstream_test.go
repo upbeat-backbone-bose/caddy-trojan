@@ -1,17 +1,16 @@
 package app
 
- import (
- 	"context"
+import (
+	"context"
 	"strings"
- 	"sync"
- 	"testing"
- 	"time"
- 
- 	"github.com/caddyserver/certmagic"
- 	"github.com/imgk/caddy-trojan/pkgs/trojan"
- 	"github.com/imgk/caddy-trojan/pkgs/x"
- )
+	"sync"
+	"testing"
+	"time"
 
+	"github.com/caddyserver/certmagic"
+	"github.com/imgk/caddy-trojan/pkgs/trojan"
+	"github.com/imgk/caddy-trojan/pkgs/x"
+)
 
 // TestMemoryUpstreamValidateConsumeDelete exercises the key lifecycle of
 // MemoryUpstream: Add → Validate hit/miss → Consume → Delete → Validate miss.
@@ -230,12 +229,12 @@ func TestCaddyUpstreamValidateAppliesDelay(t *testing.T) {
 //
 // storeCount / loadCount / existsCount record how many times each operation
 type memStorage struct {
-	mu         sync.Mutex
-	data       map[string][]byte
-	storeCount int
-	loadCount  int
+	mu          sync.Mutex
+	data        map[string][]byte
+	storeCount  int
+	loadCount   int
 	existsCount int
-	lastKey    string
+	lastKey     string
 }
 
 func newMemStorage() *memStorage {
@@ -342,16 +341,11 @@ func TestCaddyUpstreamValidHexKeyStillWorks(t *testing.T) {
 }
 
 // TestCaddyUpstreamRejectsPathTraversal verifies that Validate/Consume reject
-// keys containing "../" segments or absolute-path components before touching
-// the underlying storage. Without this, an attacker who controls the trojan
-// header can read Exists on (and even create/overwrite arbitrary storage
-// paths) outside the configured prefix.
-//
-// Pre-fix the code does `key := u.prefix + k` and passes the joined string
-// straight to certmagic.FileStorage, whose Filename() uses filepath.Join —
-// that escapes the prefix on "..". The test plants a "bait" value at the
-// exfiltrated path and asserts post-fix that Exists never sees the path and
-// Consume never creates/overwrites it.
+// keys with "../" or absolute-path components before touching storage, so an
+// attacker controlling the trojan header cannot read or write paths outside
+// the configured prefix. Pre-fix, prefix+k went straight to
+// certmagic.FileStorage whose filepath.Join escapes on ".."; the test plants a
+// "bait" value at the escaped path and asserts Exists/Consume never reach it.
 func TestCaddyUpstreamRejectsPathTraversal(t *testing.T) {
 	t.Parallel()
 
@@ -374,7 +368,7 @@ func TestCaddyUpstreamRejectsPathTraversal(t *testing.T) {
 		name string
 		key  string
 	}{
-		{"relative_traversal", "../../../etc/passwd" + "/foo"},                  // pad to 56 to satisfy len == HeaderLen check is NOT done in fix; instead, fix rejects ALL non-hex regardless of length
+		{"relative_traversal", "../../../etc/passwd" + "/foo"}, // pad to 56 to satisfy len == HeaderLen check is NOT done in fix; instead, fix rejects ALL non-hex regardless of length
 		{"too_short_traversal", "../bad"},
 		{"absolute_path_traversal", strings.Repeat("/a", 28)}, // 56 bytes of /a chars
 		{"single_dot_segment", ".."},
@@ -478,7 +472,7 @@ func TestCaddyUpstreamRejectsNonHexChars(t *testing.T) {
 		key  string
 	}{
 		{"all_slashes", strings.Repeat("/", trojan.HeaderLen)},
-		{"all_dots", strings.Repeat(".", trojan.HeaderLen)},       // "../../../../..."
+		{"all_dots", strings.Repeat(".", trojan.HeaderLen)}, // "../../../../..."
 		{"uppercase_hex", strings.Repeat("A", trojan.HeaderLen)},
 		{"mixed_with_2e", "../" + strings.Repeat("a", trojan.HeaderLen-3)},
 		{"space_padded", strings.Repeat(" ", trojan.HeaderLen)},
@@ -539,4 +533,3 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
-

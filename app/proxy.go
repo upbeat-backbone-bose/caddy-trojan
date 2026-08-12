@@ -313,8 +313,8 @@ func (p *HttpProxy) Close() error {
 }
 
 // validateProxyTarget rejects target addresses that could break out of the
-// HTTP CONNECT request line (e.g. CR/LF header injection) or smuggle bytes
-// into the upstream proxy connection.
+// HTTP CONNECT request line (CR/LF header injection) or smuggle bytes into
+// the upstream proxy connection.
 func validateProxyTarget(addr string) error {
 	if strings.ContainsAny(addr, "\r\n\x00 \t") {
 		return errors.New("invalid target address: control characters are not allowed")
@@ -359,8 +359,7 @@ func (p *HttpProxy) Dial(network, addr string) (net.Conn, error) {
 		return nil, fmt.Errorf("server status code error: %v", resp.StatusCode)
 	}
 	// bufio may have read past the response head into the tunnel payload;
-	// replay those bytes so the first tunneled packet is not lost. Peek of
-	// the buffered bytes is an in-memory operation and cannot fail here.
+	// replay those bytes so the first tunneled packet is not lost.
 	if n := br.Buffered(); n > 0 {
 		if b, err := br.Peek(n); err == nil {
 			return rawconn.NewConn(conn, b), nil

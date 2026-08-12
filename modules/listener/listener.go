@@ -107,9 +107,8 @@ var (
 )
 
 // sniffTimeout bounds how long a connection may stall while the listener
-// reads the trojan header prefix. Without it, an unauthenticated peer could
-// hold a goroutine and a file descriptor forever by sending a few bytes (or
-// nothing) after the TLS handshake.
+// reads the trojan header prefix, so an unauthenticated peer cannot hold a
+// goroutine and file descriptor forever after the TLS handshake.
 const sniffTimeout = 10 * time.Second
 
 type Listener struct {
@@ -164,8 +163,7 @@ func (l *Listener) loop() {
 				return
 			default:
 				l.Logger.Error(fmt.Sprintf("accept net.Conn error: %v", err))
-				// Back off briefly so a failing underlying listener (e.g.
-				// during shutdown) does not spin the loop at full speed.
+				// Back off briefly so a failing listener does not spin hot.
 				time.Sleep(100 * time.Millisecond)
 			}
 			continue
@@ -174,20 +172,14 @@ func (l *Listener) loop() {
 		go func(c net.Conn, lg *zap.Logger, up app.Upstream) {
 			b := make([]byte, trojan.HeaderLen+2)
 			// Bound the sniff read so a stalled peer cannot hold this
-			// goroutine forever. The deadline MUST be cleared before any
-			// path that hands the conn off to caddy (rewind) or to
-			// HandleWithDialer (tunnel); otherwise the sniff timeout would
-			// kill long-lived idle SSH/SCP tunnels ~sniffTimeout after the
-			// last byte arrived, with no warning. The defer below is the
-			// safety net for the read-error paths, where the conn is being
-			// closed anyway.
+			// goroutine forever. The deadline must be cleared before any
+			// handoff (rewind or HandleWithDialer), or it would kill
+			// long-lived idle tunnels.
 			_ = c.SetReadDeadline(time.Now().Add(sniffTimeout))
 			defer func() {
 				_ = c.SetReadDeadline(time.Time{})
 			}()
-			// clearDeadline cancels the sniff timeout on the current path.
-			// Call it before any handoff (rewind to caddy, or to
-			// HandleWithDialer) so the deadline never bleeds past the sniff.
+			// Cancels the sniff timeout on the current path before handoff.
 			clearDeadline := func() { _ = c.SetReadDeadline(time.Time{}) }
 
 			for n := 0; n < trojan.HeaderLen+2; n += 1 {
@@ -203,8 +195,7 @@ func (l *Listener) loop() {
 							c.Close()
 						case l.conns <- rawconn.RewindConn(c, b[:n+nr]):
 							// Rewind only the bytes actually read; on a partial
-							// read (nr > 0) that includes b[n], otherwise b[n]
-							// is uninitialized and must not be replayed.
+							// read b[n] is set, otherwise b[n] is uninitialized.
 						}
 						return
 					}
@@ -226,20 +217,16 @@ func (l *Listener) loop() {
 				}
 			}
 
-			// Sniff is complete. Clear the deadline BEFORE Validate (so the
+			// Sniff complete. Clear the deadline before Validate (so the
 			// 250ms validateDelay doesn't burn into the session deadline)
-			// and BEFORE HandleWithDialer (so the trojan tunnel inherits
-			// no read deadline at all and can stay idle as long as the
-			// client and upstream want). Without this clear, the 10s
-			// sniff deadline kills SSH/SCP tunnels during normal idle gaps
-			// (SSH keepalive is typically 60s+).
+			// and before HandleWithDialer (so the tunnel inherits no read
+			// deadline and can stay idle indefinitely).
 			clearDeadline()
 
-			// check the net.Conn
 			if b[trojan.HeaderLen] != 0x0d || b[trojan.HeaderLen+1] != 0x0a ||
 				!up.Validate(x.ByteSliceToString(b[:trojan.HeaderLen])) {
-				// Invalid CRLF terminator or unknown key: rewind and let caddy
-				// serve the connection as a normal (decoy) request.
+				// Invalid CRLF terminator or unknown key: rewind and let
+				// caddy serve the connection as a normal (decoy) request.
 				select {
 				case <-l.closed:
 					c.Close()

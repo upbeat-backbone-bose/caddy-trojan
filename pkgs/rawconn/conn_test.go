@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 )
+
 // TestRewindConnTLS verifies that plaintext already read from a *tls.Conn can
 // be replayed through RewindConn on the current Go release.
 func TestRewindConnTLS(t *testing.T) {

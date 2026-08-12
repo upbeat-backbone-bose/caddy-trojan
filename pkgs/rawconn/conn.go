@@ -13,10 +13,8 @@ import (
 //
 // The rewind is done with a wrapper rather than by reaching into the
 // unexported internals of crypto/tls.Conn, whose layout is not stable across
-// Go releases (the "input" field is a value type since Go 1.25 and is not
-// addressable via its old pointer form). The wrapper replays plaintext above
-// the TLS layer, which is data-preserving and does not depend on stdlib
-// internals.
+// Go releases. Replaying plaintext above the TLS layer is data-preserving and
+// does not depend on stdlib internals.
 func RewindConn(conn net.Conn, read []byte) net.Conn {
 	return NewConn(conn, read)
 }
@@ -47,20 +45,12 @@ func (c *conn) Read(b []byte) (int, error) {
 }
 
 // CloseWrite implements net.CloseWriter on the wrapped conn when the
-// underlying type supports half-close (e.g. *net.TCPConn) or exposes
-// a CloseWrite() method. The wrapped conn is reachable via Conn, so
-// the cast covers raw TCP, in-process pipes, and any future type that
-// opts in.
+// underlying type supports half-close (e.g. *net.TCPConn).
 //
-// Limitation: *tls.Conn is not a CloseWriter. crypto/tls has never
-// exposed half-close on its Conn type (the TLS record layer cannot
-// signal a TLS-level half-close over a single direction), so this
-// method returns "not supported" when the wrapper is asked to half-
-// close a TLS conn. Callers that need TLS half-close must work around
-// it (e.g. by shutting the read side of the underlying TCP conn
-// directly). HTTP/2 listeners — which are the only consumer of
-// rawconn on the listener path — never use TCP half-close, so this
-// limitation is a documentation note rather than a functional gap.
+// *tls.Conn is not a CloseWriter (the TLS record layer cannot signal a
+// half-close over a single direction), so the wrapper reports "not supported"
+// for TLS conns. No current rawconn consumer on the listener path uses TCP
+// half-close, so this is a documentation note rather than a functional gap.
 func (c *conn) CloseWrite() error {
 	if cc, ok := c.Conn.(*net.TCPConn); ok {
 		return cc.CloseWrite()
@@ -74,10 +64,8 @@ func (c *conn) CloseWrite() error {
 }
 
 // ConnectionState forwards the TLS state when the wrapped connection is a
-// *tls.Conn. caddy's http2listener checks the exported connectionStater
-// interface and wraps the conn so its ConnContext can recover the TLS state;
-// for non-TLS wrapped connections an empty (zero-version) state is returned,
-// which is harmless.
+// *tls.Conn, which caddy's http2listener uses to recover the TLS state. For
+// non-TLS connections an empty state is returned.
 func (c *conn) ConnectionState() tls.ConnectionState {
 	if tc, ok := c.Conn.(*tls.Conn); ok {
 		return tc.ConnectionState()

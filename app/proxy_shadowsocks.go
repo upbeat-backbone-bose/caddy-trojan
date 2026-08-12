@@ -61,9 +61,8 @@ func (p *ShadowsocksProxy) Provision(ctx caddy.Context) error {
 		p.proxy = &NoProxy{}
 	}
 
-	// The cipher must always be initialized, including when a pre_proxy chain
-	// is configured; otherwise Dial/ListenPacket would call methods on a nil
-	// core.Cipher and panic on the first connection.
+	// The cipher must always be initialized, including with a pre_proxy chain;
+	// otherwise Dial/ListenPacket would call methods on a nil core.Cipher.
 	var err error
 	p.cipher, err = core.PickCipher(p.Method, nil, p.Password)
 	if err != nil {

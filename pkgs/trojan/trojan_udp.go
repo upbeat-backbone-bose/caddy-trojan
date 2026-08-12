@@ -52,14 +52,8 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 	errCh := make(chan Result)
 	go func(rc net.PacketConn, r io.Reader, errCh chan Result) (nr int64, err error) {
 		defer func() {
-			// The reader's r.Read / io.ReadFull can return either
-			// io.EOF (client closed cleanly) or a deadline error
-			// (the writer side triggered rc.SetReadDeadline(now)
-			// to release this goroutine, or a wrapper like
-			// gorilla/websocket returned a hideTempErr-wrapped
-			// *netError with Timeout()==true). All three are
-			// "clean exit" shapes that the main goroutine can
-			// coalesce into a nil return.
+			// Coalesce clean exits (EOF, closed pipe, or a self-imposed
+			// deadline) into nil for the main goroutine.
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || isTimeoutError(err) {
 				err = nil
 			}
@@ -115,7 +109,7 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 	}(rc, r, errCh)
 
 	nr, nw, err := func(rc net.PacketConn, w io.Writer, clientR io.Reader, buf []byte, errCh chan Result, timeout time.Duration) (_, nw int64, err error) {
-	for {
+		for {
 			rc.SetReadDeadline(time.Now().Add(timeout))
 			n, addr, er := rc.ReadFrom(buf[socks.MaxAddrLen+4:])
 			if er != nil {
@@ -128,24 +122,9 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 
 			udpAddr, ok := addr.(*net.UDPAddr)
 			if !ok {
-				// PacketConn.ReadFrom can return any net.Addr; if a future
-				// proxy returns a non-UDP packet source (e.g. a TCP-backed
-				// test fake), surface the unsupported address type as a
-				// hard error and abort the session. The pre-fix comma-ok-less
-				// assertion would panic on the same input; the new branch
-				// fails loud and clean instead.
-				// Release the reader's blocked Read on r so the
-				// main goroutine does not hang on the errCh
-				// wait below. The hard error propagates
-				// through err to the main goroutine; without
-				// the release the reader would block forever
-				// (r has no other caller).
-				// trySetImmediateReadDeadline dispatches through
-				// the wakeableConn interface so wrappers like
-				// *net.PipeConn (which implements
-				// net.Conn.SetReadDeadline) are released; for
-				// opaque readers the call is a silent no-op
-				// matching the pre-fix behavior.
+				// ReadFrom may return any net.Addr; fail loud instead of
+				// panicking, and release the reader's blocked Read so the
+				// main goroutine does not hang on errCh.
 				err = fmt.Errorf("handle udp error: unsupported packet address type %T", addr)
 				trySetImmediateReadDeadline(clientR)
 				break
@@ -171,28 +150,20 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 				break
 			}
 		}
-	rc.SetWriteDeadline(time.Now())
+		rc.SetWriteDeadline(time.Now())
 
-	wakeReader(w)
-	r := <-errCh
-	// Prefer the reader goroutine's error over the writer's: the
-	// reader is the one that validates the trojan CRLF terminator, so
-	// a CRLF rejection (errInvalidCRLF) must not be masked by a
-	// concurrent writer-side error (e.g. a UDP write failing for an
-	// unrelated reason). When the reader has no error, fall back to
-	// the writer's — but if the writer's error is a clean timeout
-	// (the reader defer's rc.SetReadDeadline(now) typically triggers
-	// exactly that via the main loop's blocked ReadFrom), suppress
-	// it and report nil. Without this, every normal UDP session
-	// close (client-first EOF, 10-min idle timeout, or WS-over-UDP
-	// tunnel teardown) would log a spurious 'i/o timeout' error.
-	if r.Err != nil {
-		return r.Num, nw, r.Err
-	}
-	if isTimeoutError(err) {
-		return r.Num, nw, nil
-	}
-	return r.Num, nw, err
+		wakeReader(w)
+		r := <-errCh
+		// Prefer the reader's error (it owns CRLF validation) over the
+		// writer's, and suppress the writer's clean timeout so normal
+		// session teardown does not log a spurious i/o timeout.
+		if r.Err != nil {
+			return r.Num, nw, r.Err
+		}
+		if isTimeoutError(err) {
+			return r.Num, nw, nil
+		}
+		return r.Num, nw, err
 	}(rc, w, r, bWrite, errCh, timeout)
 
 	return nr, nw, err

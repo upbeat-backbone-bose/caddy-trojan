@@ -114,8 +114,8 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 		return
 	}(rc, r, errCh)
 
-	nr, nw, err := func(rc net.PacketConn, w io.Writer, buf []byte, errCh chan Result, timeout time.Duration) (_, nw int64, err error) {
-		for {
+	nr, nw, err := func(rc net.PacketConn, w io.Writer, clientR io.Reader, buf []byte, errCh chan Result, timeout time.Duration) (_, nw int64, err error) {
+	for {
 			rc.SetReadDeadline(time.Now().Add(timeout))
 			n, addr, er := rc.ReadFrom(buf[socks.MaxAddrLen+4:])
 			if er != nil {
@@ -134,7 +134,20 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 				// hard error and abort the session. The pre-fix comma-ok-less
 				// assertion would panic on the same input; the new branch
 				// fails loud and clean instead.
+				// Release the reader's blocked Read on r so the
+				// main goroutine does not hang on the errCh
+				// wait below. The hard error propagates
+				// through err to the main goroutine; without
+				// the release the reader would block forever
+				// (r has no other caller).
+				// trySetImmediateReadDeadline dispatches through
+				// the wakeableConn interface so wrappers like
+				// *net.PipeConn (which implements
+				// net.Conn.SetReadDeadline) are released; for
+				// opaque readers the call is a silent no-op
+				// matching the pre-fix behavior.
 				err = fmt.Errorf("handle udp error: unsupported packet address type %T", addr)
+				trySetImmediateReadDeadline(clientR)
 				break
 			}
 			l := func(bb []byte, addr *net.UDPAddr) int64 {
@@ -180,7 +193,7 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
 		return r.Num, nw, nil
 	}
 	return r.Num, nw, err
-	}(rc, w, bWrite, errCh, timeout)
+	}(rc, w, r, bWrite, errCh, timeout)
 
 	return nr, nw, err
 }

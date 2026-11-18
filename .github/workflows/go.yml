@@ -5,27 +5,58 @@ name: Go
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "**" ]
+    tags-ignore: [ "v*" ]
   pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
 
 # Least privilege: the workflow only needs to read the repository.
 permissions:
   contents: read
 
+# One run per ref; a newer push supersedes an in-flight run of the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+
+  # Pre-compile gate: everything has to build, vet clean and pass the tests
+  # before a pull request can be merged.
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v7
       with:
         go-version-file: 'go.mod'
+        cache: true
 
     - name: Build
       run: go build -v -ldflags="-s -w" -trimpath -tags="malloc_syscall" ./...
 
+    - name: Vet
+      run: go vet ./...
+
     - name: Test
-      run: go test -v ./...
+      run: go test -count=1 -timeout 300s ./...
+
+  # Protocol gate: drives a real trojan handshake against a freshly built
+  # binary (correct password must be forwarded, wrong password must be
+  # rejected). See tools/e2e/smoke.sh.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version-file: 'go.mod'
+        cache: true
+
+    - name: Trojan protocol end-to-end
+      run: bash tools/e2e/smoke.sh
+

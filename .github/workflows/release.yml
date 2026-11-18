@@ -40,9 +40,9 @@ jobs:
     name: gate (build, vet, test, e2e)
     runs-on: ubuntu-latest
     steps:
+    # The triggering ref is the tag for tag pushes and releases, and the
+    # branch for a manual rehearsal.
     - uses: actions/checkout@v7
-      with:
-        ref: ${{ inputs.tag || github.ref }}
 
     - name: Set up Go
       uses: actions/setup-go@v7
@@ -76,8 +76,6 @@ jobs:
           - { label: linux-386,   goos: linux, goarch: "386" }
     steps:
     - uses: actions/checkout@v7
-      with:
-        ref: ${{ inputs.tag || github.ref }}
 
     - name: Set up Go
       uses: actions/setup-go@v7

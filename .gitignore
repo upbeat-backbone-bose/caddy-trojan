@@ -26,6 +26,13 @@ Network Trash Folder
 Temporary Items
 .apdisk
 
+# Local build output (release binaries, e2e scratch binaries)
+dist/
+
 **/__debug_bin*
 .vscode/launch.json
 .vscode/Caddyfile
+
+# Python bytecode from the e2e client
+__pycache__/
+*.pyc

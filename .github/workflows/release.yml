@@ -132,10 +132,12 @@ jobs:
       run: |
         set -euo pipefail
         assets=(dist/caddy-* dist/SHA256SUMS.txt)
-        if gh release view "$VERSION" >/dev/null 2>&1; then
-          gh release upload "$VERSION" "${assets[@]}" --clobber
+        # This job has no checkout, so the repository has to be named
+        # explicitly: gh cannot infer it from the git remote.
+        if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          gh release upload "$VERSION" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
         else
-          gh release create "$VERSION" "${assets[@]}" --title "$VERSION" --generate-notes
+          gh release create "$VERSION" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --title "$VERSION" --generate-notes
         fi
 
     - name: Rehearsal finished

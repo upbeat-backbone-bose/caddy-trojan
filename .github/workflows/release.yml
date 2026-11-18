@@ -1,0 +1,147 @@
+# Release pipeline: gate -> build every supported platform -> publish assets.
+#
+# Triggers:
+#   * pushing a tag matching v*        -> gate, build, create/refresh the release
+#   * publishing a GitHub release      -> gate, build, upload the assets
+#   * workflow_dispatch                -> rehearsal (dry run unless publish=true)
+#
+# The gate (verify) must pass before any binary is built, and the binaries are
+# only attached to the release after every target built successfully.
+
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+  release:
+    types: [ published ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build, e.g. v0.3.0"
+        required: true
+        type: string
+      publish:
+        description: "Attach the assets to the release (default: false, rehearsal only)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+
+jobs:
+
+  # Pre-compile gate: nothing is built for publishing until this passes.
+  verify:
+    name: gate (build, vet, test, e2e)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ inputs.tag || github.ref }}
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version-file: 'go.mod'
+        cache: true
+
+    - name: Build
+      run: go build -v -trimpath -tags "malloc_syscall" ./...
+
+    - name: Vet
+      run: go vet ./...
+
+    - name: Test
+      run: go test -count=1 -timeout 300s ./...
+
+    - name: Trojan protocol end-to-end
+      run: bash tools/e2e/smoke.sh
+
+  # One job per target. CGO is disabled, so every binary is static and the
+  # cross build needs no C toolchain.
+  build:
+    name: build ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: linux-amd64, goos: linux, goarch: amd64 }
+          - { label: linux-arm64, goos: linux, goarch: arm64 }
+          - { label: linux-386,   goos: linux, goarch: "386" }
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ inputs.tag || github.ref }}
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version-file: 'go.mod'
+        cache: true
+
+    - name: Build binary
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        CGO_ENABLED: "0"
+      run: |
+        set -euo pipefail
+        out="caddy-${{ matrix.label }}"
+        go build -v -trimpath -tags "malloc_syscall" \
+          -ldflags "-s -w -X github.com/caddyserver/caddy/v2.CustomVersion=${VERSION}" \
+          -o "dist/$out" ./cmd/caddy
+        (cd dist && sha256sum "$out" > "$out.sha256")
+        ls -l "dist/$out"
+
+    - name: Upload binary
+      uses: actions/upload-artifact@v7
+      with:
+        name: caddy-${{ matrix.label }}
+        path: dist/*
+        if-no-files-found: error
+        retention-days: 7
+
+  # Attach every binary to the release.
+  publish:
+    name: publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v8
+      with:
+        path: dist
+        merge-multiple: true
+
+    - name: Checksum manifest
+      run: |
+        set -euo pipefail
+        cd dist
+        sha256sum caddy-* > SHA256SUMS.txt
+        cat SHA256SUMS.txt
+
+    - name: Attach assets to the release
+      if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        assets=(dist/caddy-* dist/SHA256SUMS.txt)
+        if gh release view "$VERSION" >/dev/null 2>&1; then
+          gh release upload "$VERSION" "${assets[@]}" --clobber
+        else
+          gh release create "$VERSION" "${assets[@]}" --title "$VERSION" --generate-notes
+        fi
+
+    - name: Rehearsal finished
+      if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
+      run: |
+        echo "rehearsal: ${VERSION} built for every target, nothing published"
+        ls -l dist

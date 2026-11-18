@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 
@@ -119,6 +120,12 @@ func writeTrojanUnixHandshake(conn net.Conn, network, addr string) error {
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return fmt.Errorf("invalid port: %w", err)
+	}
+	// Reject out-of-range ports before the narrowing conversion below:
+	// strconv.Atoi returns an int, and uint16(port) would silently
+	// truncate (e.g. 70000 -> 4464) and address the wrong service.
+	if port < 0 || port > math.MaxUint16 {
+		return fmt.Errorf("invalid port: %d out of range", port)
 	}
 
 	ip := net.ParseIP(host)

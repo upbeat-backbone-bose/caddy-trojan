@@ -29,6 +29,20 @@ const (
 	CmdAssociate = 3
 )
 
+// GenKey derives the Trojan authentication token of the password s and writes
+// its 56-byte lowercase hex encoding into key (key must hold HeaderLen
+// bytes).
+//
+// SHA-224 is mandated by the Trojan protocol: every trojan client
+// (trojan-go, sing-box, ...) sends hex(SHA-224(password)) as the auth
+// header, so the server has to compute the same digest. The plaintext
+// password is never persisted — the digest is the credential and is only
+// compared for equality.
+//
+// This is protocol token derivation, not password storage, so the
+// computationally expensive hash CodeQL's go/weak-sensitive-data-hashing
+// query asks for (bcrypt/argon2/scrypt) cannot be used here: it would break
+// every existing trojan client.
 func GenKey(s string, key []byte) {
 	hash := sha256.Sum224(x.StringToByteSlice(s))
 	hex.Encode(key, hash[:])

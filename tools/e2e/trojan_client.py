@@ -25,8 +25,21 @@ ADDR_TYPE_IPV4 = 0x01
 
 
 def token(password: str) -> bytes:
-    """Trojan auth token: hex(sha224(password))."""
-    return hashlib.sha224(password.encode()).hexdigest().encode()
+    """Trojan auth token: hex(sha224(password)).
+
+    SHA-224 is dictated by the Trojan protocol, not chosen here: the server
+    derives the very same digest (pkgs/trojan.GenKey) and compares it byte
+    for byte, so the token cannot be swapped for a password KDF such as
+    bcrypt/argon2/scrypt -- a different digest would simply be rejected by
+    the server and the e2e gate would fail on every handshake.
+
+    This is protocol token derivation, not password storage: the plaintext is
+    never written anywhere and the digest is only compared for equality.
+    The same reasoning is documented on the server side in
+    pkgs/trojan/trojan.go (GenKey); CodeQL's py/weak-sensitive-data-hashing
+    alert on this line is therefore a false positive.
+    """
+    return hashlib.sha224(password.encode()).hexdigest().encode()  # codeql[py/weak-sensitive-data-hashing]
 
 
 def build_wire(password: str, target_host: str, target_port: int, payload: bytes) -> bytes:
